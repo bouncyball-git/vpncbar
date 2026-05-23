@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build the utun-capable vpnc (in ./vpnc) for macOS without certificate support,
-# which we don't use (PSK + XAUTH only). Produces ./vpnc/bin/vpnc.
+# Build the utun-capable vpnc (in ./vpnc-utun) for macOS without certificate
+# support, which we don't use (PSK + XAUTH only). Produces ./vpnc-utun/bin/vpnc.
 #
 #   CRYPTO_NONE=yes   skip GnuTLS/OpenSSL cert code; core crypto via libgcrypt
 #   SCRIPT_PATH=...   bake in the network-config script so the binary is self-contained
@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VPNC_DIR="vpnc"
+VPNC_DIR="vpnc-utun"
 SCRIPT_PATH="${SCRIPT_PATH:-/opt/local/etc/vpnc/vpnc-script}"
 
 # MacPorts tools (libgcrypt-config) must be on PATH.
@@ -29,4 +29,4 @@ make -C "$VPNC_DIR" CRYPTO_NONE=yes SCRIPT_PATH="$SCRIPT_PATH"
 echo
 echo "Built $(pwd)/$VPNC_DIR/bin/vpnc"
 "$VPNC_DIR/bin/vpnc" --version | head -1
-echo "Install over the system binary:  sudo $VPNC_DIR/install-utun-vpnc.sh"
+echo "Install over the system binary:  sudo ./install-utun-vpnc.sh"

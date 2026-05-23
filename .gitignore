@@ -1,4 +1,6 @@
 build/bin
 *.log
-*.obj
+*.o
 .DS_Store
+cisco_decrypt
+vpnc

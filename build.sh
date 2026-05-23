@@ -5,11 +5,11 @@ cd "$(dirname "$0")"
 
 BUILDDIR="build/bin"
 APP="$BUILDDIR/VpncBar.app"
+SRCDIR="src"
 
-# Compile every .swift file in the project (root + Sources/), excluding the
-# build output dir and the standalone icon generator (which has its own main).
-# Works whether the code is one file or split across many.
-SOURCES=$(find . -name '*.swift' -not -path "./build/*" -not -name 'make-icon.swift' | sort)
+# Compile every .swift file under src/, excluding the standalone icon generator
+# (which has its own main). Works whether the code is one file or split across many.
+SOURCES=$(find "$SRCDIR" -name '*.swift' -not -name 'make-icon.swift' | sort)
 if [ -z "$SOURCES" ]; then
     echo "error: no .swift files found" >&2
     exit 1
@@ -24,12 +24,12 @@ echo "Assembling $APP…"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 mv "$BUILDDIR/vpncbar" "$APP/Contents/MacOS/VpncBar"
-cp Info.plist "$APP/Contents/Info.plist"
+cp "$SRCDIR/Info.plist" "$APP/Contents/Info.plist"
 
-# App icon (generate once with: swift make-icon.swift && iconutil -c icns ...).
-if [ -f VpncBar.icns ]; then
+# App icon (generate once with: swift src/make-icon.swift && iconutil -c icns ...).
+if [ -f "$SRCDIR/VpncBar.icns" ]; then
     mkdir -p "$APP/Contents/Resources"
-    cp VpncBar.icns "$APP/Contents/Resources/VpncBar.icns"
+    cp "$SRCDIR/VpncBar.icns" "$APP/Contents/Resources/VpncBar.icns"
 else
     echo "(no VpncBar.icns — app will use the default icon)"
 fi

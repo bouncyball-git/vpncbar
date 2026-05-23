@@ -4,10 +4,10 @@
 # Run with sudo:  sudo ./install-utun-vpnc.sh
 set -e
 
-SRC="$(cd "$(dirname "$0")" && pwd)/bin/vpnc"
+SRC="$(cd "$(dirname "$0")" && pwd)/vpnc-utun/bin/vpnc"
 DEST="/opt/local/sbin/vpnc"
 
-[ -f "$SRC" ] || { echo "error: build first — missing $SRC (run: make CRYPTO_NONE=yes SCRIPT_PATH=/opt/local/etc/vpnc/vpnc-script)"; exit 1; }
+[ -f "$SRC" ] || { echo "error: build first — missing $SRC (run: ./build-vpnc.sh)"; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "error: run with sudo"; exit 1; }
 
 if [ ! -f "$DEST.macports.bak" ]; then
