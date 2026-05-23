@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")"
 
-BUILDDIR="build/bin"
+BUILDDIR="bin"
 APP="$BUILDDIR/VpncBar.app"
 SRCDIR="src"
 

@@ -7,8 +7,8 @@ cd "$(dirname "$0")"
 # So vpnc-utun/Makefile can find libgcrypt-config while parsing (even for clean).
 export PATH="/opt/local/bin:$PATH"
 
-echo "Cleaning VpncBar app build (build/)…"
-rm -rf build
+echo "Cleaning VpncBar app build (bin/)…"
+rm -rf bin
 
 echo "Cleaning vpnc-utun (objects + bin/)…"
 if [ -f vpnc-utun/Makefile ]; then
