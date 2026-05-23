@@ -1,0 +1,9 @@
+{
+  "name": "work",
+  "gateway": "vpn.example.com",
+  "id": "GROUPNAME",
+  "username": "your.username",
+  "extra": [
+    "IKE Authmode psk"
+  ]
+}
