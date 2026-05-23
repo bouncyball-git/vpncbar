@@ -45,8 +45,10 @@ SYSTEMDDIR=$(PREFIX)/lib/systemd/system
 
 PKG_CONFIG ?= pkg-config
 LIBGCRYPT_CONFIG ?= libgcrypt-config
-LIBGCRYPT_LDADD = $(shell $(PKG_CONFIG) --libs libgcrypt || $(LIBGCRYPT_CONFIG) --libs)
-LIBGCRYPT_CFLAGS = $(shell $(PKG_CONFIG) --cflags libgcrypt || $(LIBGCRYPT_CONFIG) --cflags)
+# Probe pkg-config quietly; fall back to libgcrypt-config when it's absent
+# (2>/dev/null hides the "pkg-config: command not found" noise on macOS).
+LIBGCRYPT_LDADD = $(shell $(PKG_CONFIG) --libs libgcrypt 2>/dev/null || $(LIBGCRYPT_CONFIG) --libs)
+LIBGCRYPT_CFLAGS = $(shell $(PKG_CONFIG) --cflags libgcrypt 2>/dev/null || $(LIBGCRYPT_CONFIG) --cflags)
 
 ifneq ($(CRYPTO_NONE), yes)
 CRYPTO_SRC = src/crypto.c
@@ -82,6 +84,8 @@ export VERSION
 CC ?= gcc
 CFLAGS ?= -O3 -g
 CFLAGS += -W -Wall -Wmissing-declarations -Wwrite-strings
+# Silence benign unused-variable/parameter warnings in upstream vpnc sources.
+CFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-parameter
 CFLAGS += $(LIBGCRYPT_CFLAGS) $(CRYPTO_CFLAGS)
 CPPFLAGS += -DVERSION=\"$(VERSION)\" -DSCRIPT_PATH=\"$(SCRIPT_PATH)\"
 LDFLAGS ?= -g
@@ -92,8 +96,10 @@ ifeq ($(shell uname -s), SunOS)
 LIBS += -lnsl -lresolv -lsocket
 endif
 ifneq (,$(findstring Apple,$(shell $(CC) --version)))
-# enabled in FSF GCC, disabled by default in Apple GCC
-CFLAGS += -fstrict-aliasing -freorder-blocks -fsched-interblock
+# enabled in FSF GCC, disabled by default in Apple GCC.
+# -freorder-blocks/-fsched-interblock are GCC-only; modern Apple clang
+# rejects them with warnings, so only pass the flag clang supports.
+CFLAGS += -fstrict-aliasing
 endif
 
 all: $(addprefix $(BUILDDIR)/,$(BINS)) src/vpnc.8
