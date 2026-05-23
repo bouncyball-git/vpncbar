@@ -1,4 +1,4 @@
-build/bin
+/bin/
 *.log
 *.o
 .DS_Store
