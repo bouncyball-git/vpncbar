@@ -432,7 +432,8 @@ func connect(_ p: Profile) -> ActionResult {
 
     // Each profile gets its own pidfile so multiple tunnels can run at once.
     let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p), "-"], stdin: config)
-    appendConnectLog(p, status: r.status, out: r.out, err: r.err)
+    appendVpncLog(p, action: "connect", status: r.status, out: r.out, err: r.err,
+                  emptyNote: "(vpnc produced no output — raise Debug level on the Options tab for detail)")
     if r.status == 0 { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once to allow passwordless vpnc.")
@@ -445,6 +446,8 @@ func connect(_ p: Profile) -> ActionResult {
 func disconnect(_ p: Profile) -> ActionResult {
     let target = connectedTunnels([p])[p.name].map { "\($0.pid)" } ?? pidFile(p)
     let r = run(kSudo, ["-n", kVpncDisconnect, target])
+    appendVpncLog(p, action: "disconnect", status: r.status,
+                  out: "target: \(target)\n" + r.out, err: r.err)
     if r.status == 0 || r.out.contains("no vpnc") { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once.")
@@ -518,21 +521,33 @@ func grouped(_ n: Int) -> String {
     return f.string(from: NSNumber(value: n)) ?? "\(n)"
 }
 
-// Append vpnc's connection output to the profile's log (for the Debug tab). vpnc
-// daemonizes after the handshake, so this captures the useful connect-time output;
-// raise the profile's Debug level for more detail.
-func appendConnectLog(_ p: Profile, status: Int32, out: String, err: String) {
+// Append a vpnc action (connect/disconnect) and its output to the profile's log.
+// vpnc daemonizes after the handshake and then logs to syslog, so this file only
+// holds the foreground stdout we capture (handshake + hex dumps for connect, and
+// vpnc-disconnect's own output) — the Debug tab pairs it with the system log.
+func appendVpncLog(_ p: Profile, action: String, status: Int32, out: String, err: String,
+                   emptyNote: String = "(no output)") {
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    var entry = "===== connect \(f.string(from: Date())) — vpnc exit \(status) =====\n"
+    var entry = "===== \(action) \(f.string(from: Date())) — exit \(status) =====\n"
     let body = [out, err].filter { !$0.isEmpty }.joined(separator: "\n")
-    entry += body.isEmpty
-        ? "(vpnc produced no output — raise Debug level on the Options tab for detail)\n"
-        : (body.hasSuffix("\n") ? body : body + "\n")
+    entry += body.isEmpty ? emptyNote + "\n" : (body.hasSuffix("\n") ? body : body + "\n")
     if let fh = FileHandle(forWritingAtPath: logFile(p)) {
         fh.seekToEndOfFile(); fh.write(Data(entry.utf8)); fh.closeFile()
     } else {
         try? entry.write(toFile: logFile(p), atomically: true, encoding: .utf8)
     }
+}
+
+// vpnc's real runtime narrative (connection status, DPD, teardown) and ALL
+// disconnect messages go to the unified system log, not our pipe. Pull them for
+// the Debug tab. Scoped to process "vpnc"; `log show` is slow, so call off-main.
+func vpncSyslog(minutes: Int) -> String {
+    let r = run("/usr/bin/log", ["show",
+                                 "--predicate", "process == \"vpnc\"",
+                                 "--last", "\(minutes)m",
+                                 "--info", "--debug", "--style", "compact"])
+    let text = r.status == 0 ? r.out : (r.err.isEmpty ? r.out : r.err)
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 // MARK: - Profile menu row (left-click connect, right-click edit)
@@ -1056,7 +1071,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
     let statsTextView = NSTextView()
     let debugTextView = NSTextView()
     private var refreshTimer: Timer?
-    private var lastDebugLog = "\u{0}"   // sentinel so the first refresh always loads
     let nameField = NSTextField()
     let gatewayField = NSTextField()
     let idField = NSTextField()
@@ -1238,8 +1252,10 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
         ])
         authModeChanged()   // set initial enabled/grayed state for the auth fields
 
-        // Live-refresh the Stats/Debug tabs while the editor is open.
+        // Info tab refreshes live (cheap); Debug loads once now and on its Refresh
+        // button (the system-log query is slow, so it's not on the timer).
         refreshTick()
+        reloadDebug()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshTick() }
         RunLoop.main.add(t, forMode: .common)
         refreshTimer = t
@@ -1283,13 +1299,13 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
             sv.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -12),
             sv.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -12),
         ])
-        let item = NSTabViewItem(); item.label = "Stats"; item.view = v
+        let item = NSTabViewItem(); item.label = "Info"; item.view = v
         return item
     }
 
     private func debugTab() -> NSTabViewItem {
         let sv = makeTextScroll(debugTextView, monospaced: true)
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshTick))
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(reloadDebug))
         let clear = NSButton(title: "Clear log", target: self, action: #selector(clearLog))
         let reveal = NSButton(title: "Reveal log", target: self, action: #selector(revealLog))
         for b in [refresh, clear, reveal] { b.bezelStyle = .rounded }
@@ -1310,22 +1326,31 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
         return item
     }
 
+    // Cheap, runs on the 1s timer: just the Info tab.
     @objc func refreshTick() {
         let stats = buildStatsText()
         if statsTextView.string != stats { statsTextView.string = stats }
-        let log = buildDebugText()
-        if log != lastDebugLog {
-            lastDebugLog = log
-            debugTextView.string = log
-            debugTextView.scrollToEndOfDocument(nil)
+    }
+
+    // The Debug refresh (Refresh button + initial load). `log show` is slow, so do
+    // it off the main thread and only on demand — not on the 1s timer.
+    @objc func reloadDebug() {
+        if debugTextView.string.isEmpty { debugTextView.string = "Loading vpnc log…" }
+        let p = existing
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let text = ProfileEditor.buildDebugText(p)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.debugTextView.string = text
+                self.debugTextView.scrollToEndOfDocument(nil)
+            }
         }
     }
 
     @objc private func clearLog() {
         guard let p = existing else { return }
-        try? Data().write(to: URL(fileURLWithPath: logFile(p)))
-        lastDebugLog = "\u{0}"
-        refreshTick()
+        try? Data().write(to: URL(fileURLWithPath: logFile(p)))   // only the part we own
+        reloadDebug()
     }
 
     @objc private func revealLog() {
@@ -1372,21 +1397,55 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
         return s
     }
 
-    private func buildDebugText() -> String {
-        guard let p = existing else { return "Save this profile first." }
-        let path = logFile(p)
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
-              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return """
-            No vpnc log yet for “\(p.name)”.
+    // Static + off-main-safe (no UI access): runs the slow `log show`. Merges the
+    // system log (disconnect/runtime, all tunnels) with our captured connect/
+    // disconnect stdout (handshake + routes, this profile) into one time-ordered view.
+    static func buildDebugText(_ p: Profile?) -> String {
+        guard let p = p else { return "Save this profile first, then connect to see logs." }
 
-            Connect this VPN and vpnc's connection output appears here.
-            Raise the Debug level on the Options tab for more detail.
-
-            Log file: \(path)
-            """
+        func fmt(_ pattern: String) -> DateFormatter {
+            let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = pattern; return f
         }
-        return raw
+        let sysFmt = fmt("yyyy-MM-dd HH:mm:ss.SSS")
+        let capFmt = fmt("yyyy-MM-dd HH:mm:ss")
+
+        var events: [(when: Date, text: String)] = []
+
+        // System log: one event per line that begins with a timestamp.
+        for line in vpncSyslog(minutes: 30).split(separator: "\n") {
+            let s = String(line)
+            guard s.count >= 23, let d = sysFmt.date(from: String(s.prefix(23))) else { continue }
+            events.append((d, s))
+        }
+
+        // Captured stdout: each "===== action TIME — exit N =====" block is one
+        // event, timestamped by its header so it interleaves with the syslog lines.
+        if let raw = try? String(contentsOfFile: logFile(p), encoding: .utf8) {
+            var headerDate: Date?
+            var buf: [String] = []
+            func flush() { if let d = headerDate { events.append((d, buf.joined(separator: "\n"))) } }
+            for line in raw.split(separator: "\n", omittingEmptySubsequences: false) {
+                let s = String(line)
+                if s.hasPrefix("===== "),
+                   let r = s.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression),
+                   let d = capFmt.date(from: String(s[r])) {
+                    flush(); headerDate = d; buf = [s]
+                } else {
+                    buf.append(s)
+                }
+            }
+            flush()
+        }
+
+        guard !events.isEmpty else {
+            return "No vpnc activity for “\(p.name)” yet.\n\nConnect or disconnect this VPN, then press Refresh."
+        }
+        events.sort { $0.when < $1.when }
+        var out = "═══ vpnc activity — system log + captured output, last 30 min, time-ordered ═══\n"
+        out += "(syslog lines cover all tunnels, tagged vpnc[PID]; “===== …” blocks are “\(p.name)” only)\n\n"
+        out += events.map(\.text).joined(separator: "\n")
+        return out
     }
 
     // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid
