@@ -13,6 +13,7 @@ let kSudo = "/usr/bin/sudo"
 let kPgrep = "/usr/bin/pgrep"
 let kPs = "/bin/ps"
 let kOtool = "/usr/bin/otool"
+let kNetstat = "/usr/bin/netstat"
 let kVpncScript = "/opt/local/etc/vpnc/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
 
 // Whether the installed vpnc was built with a TLS backend (GnuTLS/OpenSSL), i.e.
@@ -40,6 +41,16 @@ func pidFile(_ p: Profile) -> String {
     let n = p.name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
     return "\(pidDir)/\(id)-\(n).pid"
 }
+
+// Per-tunnel runtime info written by vpnc-script on connect (Stats tab) and the
+// captured vpnc connection output (Debug tab). The .info file lives in a fixed
+// root-writable dir derived from VPNPID *inside the script* — we must NOT pass its
+// path on the vpnc "Script" line: that line has a 200-byte limit (GETLINE_MAX_BUFLEN)
+// and a long path truncates the script path itself, breaking the whole connect.
+// It's transient (removed on disconnect), so /var/run is fine. The .log is ours.
+let infoDir = "/var/run/vpncbar"
+func infoFile(_ p: Profile) -> String { "\(infoDir)/\(p.uuid ?? p.name).info" }
+func logFile(_ p: Profile) -> String { "\(pidDir)/\(p.uuid ?? p.name).log" }
 
 // MARK: - Model
 
@@ -421,6 +432,7 @@ func connect(_ p: Profile) -> ActionResult {
 
     // Each profile gets its own pidfile so multiple tunnels can run at once.
     let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p), "-"], stdin: config)
+    appendConnectLog(p, status: r.status, out: r.out, err: r.err)
     if r.status == 0 { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once to allow passwordless vpnc.")
@@ -438,6 +450,89 @@ func disconnect(_ p: Profile) -> ActionResult {
         return .message("sudo needs a password.\nRun install-sudoers.sh once.")
     }
     return .message("disconnect failed:\n\(r.err.isEmpty ? r.out : r.err)")
+}
+
+// MARK: - Live tunnel stats + vpnc log (Stats / Debug tabs)
+
+// Runtime values vpnc-script records to infoFile(p) on connect (removed on
+// disconnect). Only the kernel/gateway know these at connect time, so the script
+// is our source of truth rather than guessing the interface from the process.
+struct TunnelInfo {
+    var iface: String?
+    var internalIP: String?
+    var dns: String?
+    var gateway: String?
+    var defDomain: String?
+    var splitDNS: String?
+    var matchDomains: String?
+    var routes: [String] = []
+}
+
+func readTunnelInfo(_ p: Profile) -> TunnelInfo {
+    var t = TunnelInfo()
+    guard let raw = try? String(contentsOfFile: infoFile(p), encoding: .utf8) else { return t }
+    for line in raw.split(separator: "\n") {
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let k = String(line[..<eq]); let v = String(line[line.index(after: eq)...])
+        switch k {
+        case "TUNDEV":               t.iface = ne(v)
+        case "INTERNAL_IP4_ADDRESS": t.internalIP = ne(v)
+        case "INTERNAL_IP4_DNS":     t.dns = ne(v)
+        case "VPNGATEWAY":           t.gateway = ne(v)
+        case "CISCO_DEF_DOMAIN":     t.defDomain = ne(v)
+        case "CISCO_SPLIT_DNS":      t.splitDNS = ne(v)
+        case "VPNC_MATCH_DOMAINS":   t.matchDomains = ne(v)
+        case "ROUTE":                if let r = ne(v) { t.routes.append(r) }
+        default: break
+        }
+    }
+    return t
+}
+
+// rx/tx byte+packet counters for an interface, via `netstat -ib`. The columns
+// vary (the utun rows omit Address), so we count from the END, where the seven
+// numeric columns are fixed: …Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll.
+func interfaceCounters(_ iface: String) -> (rxBytes: Int, txBytes: Int, rxPkts: Int, txPkts: Int)? {
+    let r = run(kNetstat, ["-i", "-b", "-n", "-I", iface])
+    guard r.status == 0 else { return nil }
+    for line in r.out.split(separator: "\n").dropFirst() {
+        let c = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard c.count >= 8, c[0] == iface, Int(c[c.count - 1]) != nil else { continue }
+        let n = c.count
+        guard let rxp = Int(c[n - 7]), let rxb = Int(c[n - 5]),
+              let txp = Int(c[n - 4]), let txb = Int(c[n - 2]) else { continue }
+        return (rxb, txb, rxp, txp)
+    }
+    return nil
+}
+
+func humanBytes(_ n: Int) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"]
+    var v = Double(n), i = 0
+    while v >= 1024 && i < units.count - 1 { v /= 1024; i += 1 }
+    return i == 0 ? "\(n) B" : String(format: "%.1f %@", v, units[i])
+}
+
+func grouped(_ n: Int) -> String {
+    let f = NumberFormatter(); f.numberStyle = .decimal
+    return f.string(from: NSNumber(value: n)) ?? "\(n)"
+}
+
+// Append vpnc's connection output to the profile's log (for the Debug tab). vpnc
+// daemonizes after the handshake, so this captures the useful connect-time output;
+// raise the profile's Debug level for more detail.
+func appendConnectLog(_ p: Profile, status: Int32, out: String, err: String) {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    var entry = "===== connect \(f.string(from: Date())) — vpnc exit \(status) =====\n"
+    let body = [out, err].filter { !$0.isEmpty }.joined(separator: "\n")
+    entry += body.isEmpty
+        ? "(vpnc produced no output — raise Debug level on the Options tab for detail)\n"
+        : (body.hasSuffix("\n") ? body : body + "\n")
+    if let fh = FileHandle(forWritingAtPath: logFile(p)) {
+        fh.seekToEndOfFile(); fh.write(Data(entry.utf8)); fh.closeFile()
+    } else {
+        try? entry.write(toFile: logFile(p), atomically: true, encoding: .utf8)
+    }
 }
 
 // MARK: - Profile menu row (left-click connect, right-click edit)
@@ -956,8 +1051,12 @@ final class RevealableSecureField: NSView {
     }
 }
 
-final class ProfileEditor: NSObject {
+final class ProfileEditor: NSObject, NSWindowDelegate {
     let window: NSWindow
+    let statsTextView = NSTextView()
+    let debugTextView = NSTextView()
+    private var refreshTimer: Timer?
+    private var lastDebugLog = "\u{0}"   // sentinel so the first refresh always loads
     let nameField = NSTextField()
     let gatewayField = NSTextField()
     let idField = NSTextField()
@@ -990,10 +1089,11 @@ final class ProfileEditor: NSObject {
         self.onSave = onSave
         self.existing = profile
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 410, height: 470),
-                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = profile == nil ? "Add VPN" : "Edit VPN"
         window.isReleasedWhenClosed = false   // we retain it; let ARC free it
         super.init()
+        window.delegate = self
 
         nameField.stringValue = profile?.name ?? ""
         gatewayField.stringValue = profile?.gateway ?? ""
@@ -1111,6 +1211,8 @@ final class ProfileEditor: NSObject {
         tabs.translatesAutoresizingMaskIntoConstraints = false
         tabs.addTabViewItem(tab(credsGrid, "Credentials"))
         tabs.addTabViewItem(tab(optionsGrid, "Options"))
+        tabs.addTabViewItem(statsTab())
+        tabs.addTabViewItem(debugTab())
 
         let save = NSButton(title: "Save", target: self, action: #selector(saveTapped))
         save.bezelStyle = .rounded
@@ -1135,6 +1237,156 @@ final class ProfileEditor: NSObject {
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
         ])
         authModeChanged()   // set initial enabled/grayed state for the auth fields
+
+        // Live-refresh the Stats/Debug tabs while the editor is open.
+        refreshTick()
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshTick() }
+        RunLoop.main.add(t, forMode: .common)
+        refreshTimer = t
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    // A read-only, scrolled NSTextView used by both the Stats and Debug tabs.
+    private func makeTextScroll(_ tv: NSTextView, monospaced: Bool) -> NSScrollView {
+        tv.isEditable = false
+        tv.isRichText = false
+        tv.drawsBackground = true
+        tv.font = monospaced ? .monospacedSystemFont(ofSize: 11, weight: .regular)
+                             : .monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.textContainerInset = NSSize(width: 6, height: 6)
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        let sv = NSScrollView()
+        sv.documentView = tv
+        sv.hasVerticalScroller = true
+        sv.borderType = .bezelBorder
+        sv.translatesAutoresizingMaskIntoConstraints = false
+        return sv
+    }
+
+    private func statsTab() -> NSTabViewItem {
+        let sv = makeTextScroll(statsTextView, monospaced: true)
+        let v = NSView()
+        v.addSubview(sv)
+        NSLayoutConstraint.activate([
+            sv.topAnchor.constraint(equalTo: v.topAnchor, constant: 12),
+            sv.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
+            sv.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -12),
+            sv.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -12),
+        ])
+        let item = NSTabViewItem(); item.label = "Stats"; item.view = v
+        return item
+    }
+
+    private func debugTab() -> NSTabViewItem {
+        let sv = makeTextScroll(debugTextView, monospaced: true)
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshTick))
+        let clear = NSButton(title: "Clear log", target: self, action: #selector(clearLog))
+        let reveal = NSButton(title: "Reveal log", target: self, action: #selector(revealLog))
+        for b in [refresh, clear, reveal] { b.bezelStyle = .rounded }
+        let bar = NSStackView(views: [refresh, clear, reveal])
+        bar.spacing = 8
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        let v = NSView()
+        v.addSubview(sv); v.addSubview(bar)
+        NSLayoutConstraint.activate([
+            sv.topAnchor.constraint(equalTo: v.topAnchor, constant: 12),
+            sv.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
+            sv.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -12),
+            bar.topAnchor.constraint(equalTo: sv.bottomAnchor, constant: 8),
+            bar.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
+            bar.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -12),
+        ])
+        let item = NSTabViewItem(); item.label = "Debug"; item.view = v
+        return item
+    }
+
+    @objc func refreshTick() {
+        let stats = buildStatsText()
+        if statsTextView.string != stats { statsTextView.string = stats }
+        let log = buildDebugText()
+        if log != lastDebugLog {
+            lastDebugLog = log
+            debugTextView.string = log
+            debugTextView.scrollToEndOfDocument(nil)
+        }
+    }
+
+    @objc private func clearLog() {
+        guard let p = existing else { return }
+        try? Data().write(to: URL(fileURLWithPath: logFile(p)))
+        lastDebugLog = "\u{0}"
+        refreshTick()
+    }
+
+    @objc private func revealLog() {
+        guard let p = existing else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: logFile(p))])
+    }
+
+    private func buildStatsText() -> String {
+        guard let p = existing else {
+            return "Save this profile first, then connect to see live tunnel stats."
+        }
+        func row(_ k: String, _ value: String) -> String {
+            k.padding(toLength: 15, withPad: " ", startingAt: 0) + value + "\n"
+        }
+        guard let c = connectedTunnels([p])[p.name] else {
+            return row("Status:", "Not connected")
+                + "\nConnect this VPN to see its interface, IP, DNS, routes and traffic."
+        }
+        let t = readTunnelInfo(p)
+        var s = row("Status:", "Connected")
+        s += row("Uptime:", formatElapsed(c.secs))
+        s += row("vpnc PID:", "\(c.pid)")
+        if let v = t.iface { s += row("Interface:", v) }
+        if let v = t.internalIP { s += row("Internal IP:", v) }
+        if let v = t.gateway { s += row("Gateway:", v) }
+        if let v = t.dns, !v.isEmpty {
+            s += row("DNS:", v.split(separator: " ").joined(separator: ", "))
+        }
+        // Match domains: gateway-supplied + the profile's, de-duplicated, in order.
+        let allDomains = [t.defDomain, t.splitDNS, t.matchDomains]
+            .compactMap { $0 }.joined(separator: " ")
+            .split(separator: " ").map(String.init)
+        var seen = Set<String>(); var domains: [String] = []
+        for d in allDomains where seen.insert(d).inserted { domains.append(d) }
+        if !domains.isEmpty { s += row("Match domains:", domains.joined(separator: ", ")) }
+        if let first = t.routes.first {
+            s += row("Routes:", first)
+            for r in t.routes.dropFirst() { s += row("", r) }
+        }
+        if let iface = t.iface, let cnt = interfaceCounters(iface) {
+            s += row("Traffic in:", "\(humanBytes(cnt.rxBytes))  (\(grouped(cnt.rxPkts)) pkts)")
+            s += row("Traffic out:", "\(humanBytes(cnt.txBytes))  (\(grouped(cnt.txPkts)) pkts)")
+        }
+        return s
+    }
+
+    private func buildDebugText() -> String {
+        guard let p = existing else { return "Save this profile first." }
+        let path = logFile(p)
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return """
+            No vpnc log yet for “\(p.name)”.
+
+            Connect this VPN and vpnc's connection output appears here.
+            Raise the Debug level on the Options tab for more detail.
+
+            Log file: \(path)
+            """
+        }
+        return raw
     }
 
     // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid

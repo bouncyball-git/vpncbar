@@ -1123,6 +1123,44 @@ do_attempt_reconnect() {
 	set_vpngateway_route
 }
 
+# VpncBar: record this tunnel's live state so the app's Stats tab can show
+# interface/IP/DNS/routes without needing root. Keyed by VPNPID (the profile uuid,
+# already passed by VpncBar) — we deliberately do NOT take the path on the Script
+# command line, which has a 200-byte limit that a full path would overflow,
+# truncating the script path and breaking connect. World-readable; transient
+# (removed on disconnect), so /var/run is fine.
+VPNC_STATS=""
+[ -n "$VPNPID" ] && VPNC_STATS="/var/run/vpncbar/$VPNPID.info"
+write_vpnc_stats() {
+	[ -n "$VPNC_STATS" ] || return 0
+	mkdir -p /var/run/vpncbar 2>/dev/null
+	{
+		echo "TUNDEV=$TUNDEV"
+		echo "INTERNAL_IP4_ADDRESS=$INTERNAL_IP4_ADDRESS"
+		echo "INTERNAL_IP4_DNS=$INTERNAL_IP4_DNS"
+		echo "VPNGATEWAY=$VPNGATEWAY"
+		echo "CISCO_DEF_DOMAIN=$CISCO_DEF_DOMAIN"
+		echo "CISCO_SPLIT_DNS=$CISCO_SPLIT_DNS"
+		echo "VPNC_MATCH_DOMAINS=$VPNC_MATCH_DOMAINS"
+		if [ -n "$CISCO_SPLIT_INC" ]; then
+			i=0
+			while [ $i -lt "$CISCO_SPLIT_INC" ] ; do
+				eval NETWORK="\${CISCO_SPLIT_INC_${i}_ADDR}"
+				eval NETMASKLEN="\${CISCO_SPLIT_INC_${i}_MASKLEN}"
+				echo "ROUTE=$NETWORK/$NETMASKLEN"
+				i=`expr $i + 1`
+			done
+		fi
+	} > "$VPNC_STATS" 2>/dev/null
+	chmod 644 "$VPNC_STATS" 2>/dev/null
+	return 0
+}
+
+remove_vpnc_stats() {
+	[ -n "$VPNC_STATS" ] && rm -f -- "$VPNC_STATS" 2>/dev/null
+	return 0
+}
+
 #### Main
 
 if [ -z "$reason" ]; then
@@ -1138,11 +1176,13 @@ case "$reason" in
 	connect)
 		run_hooks connect
 		do_connect
+		write_vpnc_stats
 		run_hooks post-connect
 		;;
 	disconnect)
 		run_hooks disconnect
 		do_disconnect
+		remove_vpnc_stats
 		run_hooks post-disconnect
 		;;
 	attempt-reconnect)
