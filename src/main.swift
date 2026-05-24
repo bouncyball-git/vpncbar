@@ -369,7 +369,9 @@ final class ProfileMenuItemView: NSView {
             // makes it count up live, to the second.
             let elapsed = formatElapsed(max(0, Int(Date().timeIntervalSince(since))))
             let dim: NSColor = hovered ? .alternateSelectedControlTextColor : .secondaryLabelColor
-            let elAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: dim]
+            // Monospaced-digit font so ticking numerals don't change width (no jitter).
+            let monoFont = NSFont.monospacedDigitSystemFont(ofSize: font.pointSize, weight: .regular)
+            let elAttrs: [NSAttributedString.Key: Any] = [.font: monoFont, .foregroundColor: dim]
             let w = (elapsed as NSString).size(withAttributes: elAttrs).width
             (elapsed as NSString).draw(at: NSPoint(x: bounds.width - w - 12, y: 3), withAttributes: elAttrs)
         }
@@ -501,11 +503,12 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
             // Reserve room for an hour-format string so width doesn't jump when
             // a tunnel crosses the 1-hour mark while the menu is open.
             let font = NSFont.menuFont(ofSize: 0)
+            let monoFont = NSFont.monospacedDigitSystemFont(ofSize: font.pointSize, weight: .regular)
             var width: CGFloat = 200
             for p in profiles {
                 let nameW = (p.name as NSString).size(withAttributes: [.font: font]).width
                 let sample = elapsed[p.name] != nil ? "0:00:00" : ""
-                let elW = (sample as NSString).size(withAttributes: [.font: font]).width
+                let elW = (sample as NSString).size(withAttributes: [.font: monoFont]).width
                 width = max(width, 24 + ceil(nameW) + 24 + ceil(elW) + 14)
             }
             let now = Date()
