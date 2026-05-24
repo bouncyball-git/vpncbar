@@ -1,6 +1,6 @@
 # Build output
-/bin/                 # built VpncBar.app
-vendor/vpnc/bin/      # built vpnc + cisco-decrypt binaries
-*.o                   # vpnc object files
+/bin/
+vendor/vpnc/bin/
+*.o
 *.log
 .DS_Store
