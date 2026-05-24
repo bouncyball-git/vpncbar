@@ -5,9 +5,9 @@
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC_VPNC="$HERE/vpnc-utun/bin/vpnc"
-SRC_DISC="$HERE/vpnc-utun/src/vpnc-disconnect"
-SRC_SCRIPT="$HERE/vpnc-script"
+SRC_VPNC="$HERE/vendor/vpnc/bin/vpnc"
+SRC_DISC="$HERE/vendor/vpnc/src/vpnc-disconnect"
+SRC_SCRIPT="$HERE/vendor/vpnc-script"
 
 [ -f "$SRC_VPNC" ]   || { echo "error: build first — missing $SRC_VPNC (run: ./build-vpnc.sh)"; exit 1; }
 [ -f "$SRC_DISC" ]   || { echo "error: missing $SRC_DISC"; exit 1; }

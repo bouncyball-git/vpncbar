@@ -1,20 +1,20 @@
 #!/bin/sh
-# Remove all build artifacts: the VpncBar.app output and the vpnc-utun object
-# files / binaries / generated icon. Source files are left untouched.
+# Remove all build artifacts: the VpncBar.app output and the vendored vpnc
+# object files / binaries / generated icon. Source files are left untouched.
 set -e
 cd "$(dirname "$0")"
 
-# So vpnc-utun/Makefile can find libgcrypt-config while parsing (even for clean).
+# So vendor/vpnc/Makefile can find libgcrypt-config while parsing (even for clean).
 export PATH="/opt/local/bin:$PATH"
 
 echo "Cleaning VpncBar app build (bin/)…"
 rm -rf bin
 
-echo "Cleaning vpnc-utun (objects + bin/)…"
-if [ -f vpnc-utun/Makefile ]; then
-    make -C vpnc-utun clean >/dev/null 2>&1 || true
+echo "Cleaning vendor/vpnc (objects + bin/)…"
+if [ -f vendor/vpnc/Makefile ]; then
+    make -C vendor/vpnc clean >/dev/null 2>&1 || true
 fi
-rm -rf vpnc-utun/bin
+rm -rf vendor/vpnc/bin
 
 echo "Cleaning generated icon set + logs…"
 rm -rf src/VpncBar.iconset VpncBar.iconset   # intermediate; src/VpncBar.icns is kept

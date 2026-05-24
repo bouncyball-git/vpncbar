@@ -1,0 +1,76 @@
+Vendored third-party components
+===============================
+
+This directory contains third-party code copied ("vendored") into the VpncBar
+repository, with local modifications. Both components are licensed GPLv2 (or
+later); their full source is included here and our changes are described below
+and marked inline in the files.
+
+
+vendor/vpnc/  — vpnc (IPSec VPN client)
+---------------------------------------
+Upstream base : https://github.com/streambinder/vpnc   (a maintained fork of
+                vpnc 0.5.3, originally by Maurice Massar et al.)
+utun port from: https://github.com/breiter/vpnc        (0.5.3-xnu, by Brian Reiter)
+License       : GPL v2 (see vendor/vpnc/LICENSE). Includes cisco-decrypt.
+
+Local modifications (to run on Apple Silicon / modern macOS using the kernel's
+native "utun" interface instead of the unavailable tuntaposx kext):
+
+  src/sysdep.c
+    - Added macOS utun headers (sys/kern_control.h, sys/sys_domain.h,
+      net/if_utun.h, sys/uio.h, netinet/ip.h) under __APPLE__.
+    - xnu_open_utun(): open a PF_SYSTEM / SYSPROTO_CONTROL socket and connect to
+      the "com.apple.net.utun_control" kernel control (no kext required).
+    - utun_open(): probe utun units for a free one and return its name (e.g. utun4).
+    - utun_read()/utun_write(): handle utun's mandatory 4-byte address-family
+      header on every packet.
+    - tun_open(): on __APPLE__, prefer native utun; fall back to /dev/tunN.
+    (utun implementation ported from breiter/vpnc 0.5.3-xnu.)
+
+  src/sysdep.h
+    - Declarations for utun_open / utun_read / utun_write under __APPLE__.
+
+  src/tunip.c
+    - get_current_dir_name() shim for macOS/BSD (it is a glibc-only function;
+      without this the fork does not compile on macOS).
+    - TUN_READ / TUN_WRITE dispatch macros: use utun_read/utun_write when the
+      interface name is "utunN", otherwise the classic tun_read/tun_write.
+
+  src/vpnc-disconnect
+    - Accept either a pidfile path OR a numeric PID, and verify the target is a
+      vpnc process before signalling it. Enables disconnecting an individual
+      tunnel when several run at once (one vpnc per profile).
+
+  src/config.c
+    - Version banner reports "0.5.3 (utun)".
+
+  Makefile
+    - Dropped GCC-only -freorder-blocks / -fsched-interblock (Apple clang rejects
+      them); silenced the pkg-config probe (falls back to libgcrypt-config);
+      added -Wno-unused-* to quiet benign upstream warnings.
+
+  Build: make CRYPTO_NONE=yes SCRIPT_PATH=/opt/local/etc/vpnc/vpnc-script
+         (certificate support is omitted; we use PSK + XAUTH only.)
+
+
+vendor/vpnc-script  — network configuration script
+---------------------------------------------------
+Upstream : https://gitlab.com/openconnect/vpnc-scripts  (vpnc-script)
+License  : GPL v2 or later (see header in the file).
+
+Local modifications (marked inline with "VpncBar policy" comments):
+
+  - Never modify the system default route. set_ipv4_default_route /
+    reset_ipv4_default_route (and the IPv6 pair) are overridden to no-ops after
+    the OS-specific definitions. VPN split-include routes are still installed, so
+    multiple full-tunnel VPNs can coexist without contending for the default route.
+
+  - macOS scoped ("split") DNS only. Register a per-tunnel scoped resolver at
+    State:/Network/Service/<utun>/DNS with SupplementalMatchDomains taken from the
+    gateway (CISCO_DEF_DOMAIN, CISCO_SPLIT_DNS) plus a VPNC_MATCH_DOMAINS env var
+    supplied by VpncBar. Removed the global-DNS takeover the upstream used
+    (OverridePrimary, networksetup -setdnsservers, and prepending to the primary
+    service DNS). Also dropped the State:/Network/Service/<utun>/IPv4 service
+    registration, which configd pruned (taking the scoped DNS with it). If no
+    match domain is known, that VPN's DNS is skipped rather than applied globally.

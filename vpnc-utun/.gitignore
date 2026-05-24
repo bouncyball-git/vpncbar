@@ -1,5 +1,0 @@
-bin/
-src/vpnc-debug.*
-*.o
-*.8
-.DS_Store
