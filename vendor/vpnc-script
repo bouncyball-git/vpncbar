@@ -630,7 +630,10 @@ modify_resolvconf_generic() {
 
 	DOMAINS="$CISCO_DEF_DOMAIN"
 
-	exec 6< "$RESOLV_CONF_BACKUP"
+	# The backup is absent when /etc/resolv.conf already had our marker (a prior
+	# run). Reading a missing file via `exec` aborts the whole script (killing the
+	# DNS setup below), so fall back to /dev/null instead.
+	if [ -f "$RESOLV_CONF_BACKUP" ]; then exec 6< "$RESOLV_CONF_BACKUP"; else exec 6< /dev/null; fi
 	while read LINE <&6 ; do
 		case "$LINE" in
 			# omit; we will overwrite these
