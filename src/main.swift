@@ -433,7 +433,8 @@ func connect(_ p: Profile) -> ActionResult {
     // Each profile gets its own pidfile so multiple tunnels can run at once.
     let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p), "-"], stdin: config)
     appendVpncLog(p, action: "connect", status: r.status, out: r.out, err: r.err,
-                  emptyNote: "(vpnc produced no output — raise Debug level on the Options tab for detail)")
+                  emptyNote: "(vpnc produced no output — raise Debug level on the Options tab for detail)",
+                  truncate: true)   // fresh log: keep only this (latest) connection
     if r.status == 0 { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once to allow passwordless vpnc.")
@@ -525,25 +526,31 @@ func grouped(_ n: Int) -> String {
 // vpnc daemonizes after the handshake and then logs to syslog, so this file only
 // holds the foreground stdout we capture (handshake + hex dumps for connect, and
 // vpnc-disconnect's own output) — the Debug tab pairs it with the system log.
+// `truncate: true` (connect) starts a fresh log so only the latest session shows;
+// `false` (disconnect) appends the teardown to that same session.
 func appendVpncLog(_ p: Profile, action: String, status: Int32, out: String, err: String,
-                   emptyNote: String = "(no output)") {
+                   emptyNote: String = "(no output)", truncate: Bool = false) {
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
     var entry = "===== \(action) \(f.string(from: Date())) — exit \(status) =====\n"
     let body = [out, err].filter { !$0.isEmpty }.joined(separator: "\n")
     entry += body.isEmpty ? emptyNote + "\n" : (body.hasSuffix("\n") ? body : body + "\n")
-    if let fh = FileHandle(forWritingAtPath: logFile(p)) {
+    if truncate {
+        try? entry.write(toFile: logFile(p), atomically: true, encoding: .utf8)
+    } else if let fh = FileHandle(forWritingAtPath: logFile(p)) {
         fh.seekToEndOfFile(); fh.write(Data(entry.utf8)); fh.closeFile()
     } else {
         try? entry.write(toFile: logFile(p), atomically: true, encoding: .utf8)
     }
 }
 
-// vpnc's real runtime narrative (connection status, DPD, teardown) and ALL
-// disconnect messages go to the unified system log, not our pipe. Pull them for
-// the Debug tab. Scoped to process "vpnc"; `log show` is slow, so call off-main.
-func vpncSyslog(minutes: Int) -> String {
+// vpnc's runtime narrative (DPD, teardown) and disconnect messages go to the
+// unified system log, not our pipe. Pull them for the Debug tab — scoped to THIS
+// session's PID so old runs don't leak in. `log show` is slow, so call off-main.
+func vpncSyslog(pid: Int?, minutes: Int) -> String {
+    var predicate = "process == \"vpnc\""
+    if let pid = pid { predicate += " && processID == \(pid)" }
     let r = run("/usr/bin/log", ["show",
-                                 "--predicate", "process == \"vpnc\"",
+                                 "--predicate", predicate,
                                  "--last", "\(minutes)m",
                                  "--info", "--debug", "--style", "compact"])
     let text = r.status == 0 ? r.out : (r.err.isEmpty ? r.out : r.err)
@@ -785,16 +792,33 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     }
 
     // Right-click a profile: jump straight to its edit dialog.
-    var profileEditor: ProfileEditor?
+    // At most one editor window per profile (keyed by uuid; new profiles share the
+    // "__new__" slot). Both the menu and the Manage window open editors through here.
+    var editors: [String: ProfileEditor] = [:]
+
     func editProfile(_ name: String) {
         guard let p = loadProfiles().first(where: { $0.name == name }) else { return }
-        profileEditor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
+        openEditor(p)
+    }
+
+    func openEditor(_ p: Profile?) {
+        let key = p?.uuid ?? p?.name ?? "__new__"
+        // Already open for this profile → just bring it forward, don't duplicate.
+        if let existing = editors[key] {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let editor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
             upsert(prof, secret: secret, password: password)
             self?.refreshState()
+            self?.manageWindow?.reload()
         }
+        editor.onClose = { [weak self] in self?.editors[key] = nil }
+        editors[key] = editor
         NSApp.activate(ignoringOtherApps: true)
-        profileEditor?.window.center()
-        profileEditor?.window.makeKeyAndOrderFront(nil)
+        editor.window.center()
+        editor.window.makeKeyAndOrderFront(nil)
     }
 
     @objc func doDisconnectAll() {
@@ -835,7 +859,8 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
 
     @objc func openManage() {
         if manageWindow == nil {
-            manageWindow = ManageWindow { [weak self] in self?.refreshState() }
+            manageWindow = ManageWindow(onChange: { [weak self] in self?.refreshState() },
+                                        onEdit: { [weak self] p in self?.openEditor(p) })
         }
         NSApp.activate(ignoringOtherApps: true)
         manageWindow?.show()
@@ -875,11 +900,12 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     let window: NSWindow
     let table = NSTableView()
     var profiles: [Profile] = []
-    var editor: ProfileEditor?
     let onChange: () -> Void
+    let onEdit: (Profile?) -> Void   // open/focus the shared per-profile editor
 
-    init(onChange: @escaping () -> Void) {
+    init(onChange: @escaping () -> Void, onEdit: @escaping (Profile?) -> Void) {
         self.onChange = onChange
+        self.onEdit = onEdit
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Manage VPNs"
@@ -962,10 +988,10 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     // Buttons
-    @objc func addNew() { presentEditor(nil) }
+    @objc func addNew() { onEdit(nil) }
     @objc func editSelected() {
         guard table.selectedRow >= 0 else { return }
-        presentEditor(profiles[table.selectedRow])
+        onEdit(profiles[table.selectedRow])
     }
     @objc func removeSelected() {
         guard table.selectedRow >= 0 else { return }
@@ -990,13 +1016,6 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         reload()
     }
 
-    func presentEditor(_ p: Profile?) {
-        editor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
-            upsert(prof, secret: secret, password: password)
-            self?.reload()
-        }
-        window.beginSheet(editor!.window)
-    }
 }
 
 // MARK: - Profile editor sheet
@@ -1098,6 +1117,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
     let weakAuthCheck = NSButton(checkboxWithTitle: "Enable weak authentication", target: nil, action: nil)
     let onSave: (Profile, String?, String?) -> Void
     let existing: Profile?
+    var onClose: (() -> Void)?   // registry uses this to drop its entry on close
 
     init(profile: Profile?, onSave: @escaping (Profile, String?, String?) -> Void) {
         self.onSave = onSave
@@ -1264,6 +1284,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        onClose?()
     }
 
     // A read-only, scrolled NSTextView used by both the Stats and Debug tabs.
@@ -1410,40 +1431,58 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
         let sysFmt = fmt("yyyy-MM-dd HH:mm:ss.SSS")
         let capFmt = fmt("yyyy-MM-dd HH:mm:ss")
 
+        // The captured log already holds only the latest session (overwritten on
+        // connect). Read it first so we can find this session's PID for syslog scope.
+        let captured = (try? String(contentsOfFile: logFile(p), encoding: .utf8)) ?? ""
+
+        // Session PID: the live tunnel's PID if connected, else the last PID we
+        // logged on disconnect ("target: <pid>"). Used to scope the system log to
+        // just this connection — no old runs.
+        let live = connectedTunnels([p])[p.name]
+        var pid: Int? = live?.pid
+        if pid == nil {
+            for line in captured.split(separator: "\n") where line.contains("target:") {
+                if let r = line.range(of: #"\d+"#, options: .regularExpression) { pid = Int(line[r]) }
+            }
+        }
+        // Window: cover this connection's whole uptime (+buffer); short if idle.
+        let minutes = (live.map { $0.secs / 60 } ?? 15) + 10
+
         var events: [(when: Date, text: String)] = []
 
-        // System log: one event per line that begins with a timestamp.
-        for line in vpncSyslog(minutes: 30).split(separator: "\n") {
-            let s = String(line)
-            guard s.count >= 23, let d = sysFmt.date(from: String(s.prefix(23))) else { continue }
-            events.append((d, s))
+        // System log for this session's PID only.
+        if pid != nil {
+            for line in vpncSyslog(pid: pid, minutes: minutes).split(separator: "\n") {
+                let s = String(line)
+                guard s.count >= 23, let d = sysFmt.date(from: String(s.prefix(23))) else { continue }
+                events.append((d, s))
+            }
         }
 
         // Captured stdout: each "===== action TIME — exit N =====" block is one
         // event, timestamped by its header so it interleaves with the syslog lines.
-        if let raw = try? String(contentsOfFile: logFile(p), encoding: .utf8) {
-            var headerDate: Date?
-            var buf: [String] = []
-            func flush() { if let d = headerDate { events.append((d, buf.joined(separator: "\n"))) } }
-            for line in raw.split(separator: "\n", omittingEmptySubsequences: false) {
-                let s = String(line)
-                if s.hasPrefix("===== "),
-                   let r = s.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression),
-                   let d = capFmt.date(from: String(s[r])) {
-                    flush(); headerDate = d; buf = [s]
-                } else {
-                    buf.append(s)
-                }
+        var headerDate: Date?
+        var buf: [String] = []
+        func flush() { if let d = headerDate { events.append((d, buf.joined(separator: "\n"))) } }
+        for line in captured.split(separator: "\n", omittingEmptySubsequences: false) {
+            let s = String(line)
+            if s.hasPrefix("===== "),
+               let r = s.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression),
+               let d = capFmt.date(from: String(s[r])) {
+                flush(); headerDate = d; buf = [s]
+            } else {
+                buf.append(s)
             }
-            flush()
         }
+        flush()
 
         guard !events.isEmpty else {
-            return "No vpnc activity for “\(p.name)” yet.\n\nConnect or disconnect this VPN, then press Refresh."
+            return "No connection logged for “\(p.name)” yet.\n\nConnect this VPN, then press Refresh."
         }
         events.sort { $0.when < $1.when }
-        var out = "═══ vpnc activity — system log + captured output, last 30 min, time-ordered ═══\n"
-        out += "(syslog lines cover all tunnels, tagged vpnc[PID]; “===== …” blocks are “\(p.name)” only)\n\n"
+        let state = live != nil ? "connected, PID \(pid.map(String.init) ?? "?")" : "last session"
+        var out = "═══ vpnc — \(p.name) (\(state)), time-ordered ═══\n"
+        out += "(latest connection only; system-log lines scoped to this session's PID)\n\n"
         out += events.map(\.text).joined(separator: "\n")
         return out
     }
