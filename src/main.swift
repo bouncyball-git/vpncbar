@@ -207,10 +207,10 @@ func parseEtime(_ s: String) -> Int? {
 }
 
 func formatElapsed(_ secs: Int) -> String {
-    let d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60
+    let d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60, s = secs % 60
     if d > 0 { return "\(d)d \(h)h" }
-    if h > 0 { return "\(h)h \(m)m" }
-    return "\(m)m"
+    if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+    return String(format: "%d:%02d", m, s)
 }
 
 // Elapsed seconds for a live vpnc with this pid, or nil if it isn't a running vpnc.
@@ -330,17 +330,15 @@ func disconnect(_ name: String) -> ActionResult {
 
 final class ProfileMenuItemView: NSView {
     private let name: String
-    private let connected: Bool
-    private let elapsed: String?
+    private let connectedSince: Date?     // nil = not connected; else the moment it connected
     private let onConnect: () -> Void
     private let onEdit: () -> Void
     private var hovered = false
 
-    init(name: String, connected: Bool, elapsed: String?, width: CGFloat,
+    init(name: String, connectedSince: Date?, width: CGFloat,
          onConnect: @escaping () -> Void, onEdit: @escaping () -> Void) {
         self.name = name
-        self.connected = connected
-        self.elapsed = elapsed
+        self.connectedSince = connectedSince
         self.onConnect = onConnect
         self.onEdit = onEdit
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
@@ -365,16 +363,17 @@ final class ProfileMenuItemView: NSView {
         let font = NSFont.menuFont(ofSize: 0)
         let color: NSColor = hovered ? .alternateSelectedControlTextColor : .labelColor
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
-        if connected {
+        if let since = connectedSince {
             ("✓" as NSString).draw(at: NSPoint(x: 8, y: 3), withAttributes: attrs)
-        }
-        (name as NSString).draw(at: NSPoint(x: 24, y: 3), withAttributes: attrs)
-        if let elapsed {
+            // Recompute elapsed at draw time so a 1s tick (while the menu is open)
+            // makes it count up live, to the second.
+            let elapsed = formatElapsed(max(0, Int(Date().timeIntervalSince(since))))
             let dim: NSColor = hovered ? .alternateSelectedControlTextColor : .secondaryLabelColor
             let elAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: dim]
             let w = (elapsed as NSString).size(withAttributes: elAttrs).width
             (elapsed as NSString).draw(at: NSPoint(x: bounds.width - w - 12, y: 3), withAttributes: elAttrs)
         }
+        (name as NSString).draw(at: NSPoint(x: 24, y: 3), withAttributes: attrs)
     }
 
     // Close the menu, then run the action on the next runloop tick — after the
@@ -396,15 +395,17 @@ final class ProfileMenuItemView: NSView {
 
 // MARK: - Menu-bar controller
 
-final class AppController: NSObject, UNUserNotificationCenterDelegate {
+final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var timer: Timer?
+    var tickTimer: Timer?     // 1s redraw of elapsed times, only while the menu is open
     var manageWindow: ManageWindow?
     private var lastConnected: Set<String>?   // nil until first poll (no notification at launch)
 
     func start() {
         try? FileManager.default.createDirectory(atPath: pidDir, withIntermediateDirectories: true)
         statusItem.menu = NSMenu()
+        statusItem.menu?.delegate = self
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
@@ -468,6 +469,25 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
         completionHandler([.banner, .sound])
     }
 
+    // While the menu is open, tick the elapsed times every second. The normal
+    // poll timer is suspended during menu tracking and a default-mode timer
+    // won't fire — so this one is added in the event-tracking run-loop mode.
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshState()   // fresh times the instant it opens
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            for item in self?.statusItem.menu?.items ?? [] {
+                (item.view as? ProfileMenuItemView)?.needsDisplay = true
+            }
+        }
+        RunLoop.main.add(t, forMode: .eventTracking)
+        tickTimer = t
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        tickTimer?.invalidate()
+        tickTimer = nil
+    }
+
     func rebuildMenu(profiles: [Profile], elapsed: [String: Int]) {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
@@ -478,20 +498,22 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
             menu.addItem(none)
         } else {
             // Uniform row width so the elapsed times line up on the right edge.
+            // Reserve room for an hour-format string so width doesn't jump when
+            // a tunnel crosses the 1-hour mark while the menu is open.
             let font = NSFont.menuFont(ofSize: 0)
             var width: CGFloat = 200
             for p in profiles {
                 let nameW = (p.name as NSString).size(withAttributes: [.font: font]).width
-                let el = elapsed[p.name].map(formatElapsed) ?? ""
-                let elW = (el as NSString).size(withAttributes: [.font: font]).width
+                let sample = elapsed[p.name] != nil ? "0:00:00" : ""
+                let elW = (sample as NSString).size(withAttributes: [.font: font]).width
                 width = max(width, 24 + ceil(nameW) + 24 + ceil(elW) + 14)
             }
+            let now = Date()
             for p in profiles {
                 let item = NSMenuItem()
                 item.view = ProfileMenuItemView(
                     name: p.name,
-                    connected: elapsed[p.name] != nil,
-                    elapsed: elapsed[p.name].map(formatElapsed),
+                    connectedSince: elapsed[p.name].map { now.addingTimeInterval(-Double($0)) },
                     width: width,
                     onConnect: { [weak self] in self?.toggleProfile(p.name) },
                     onEdit: { [weak self] in self?.editProfile(p.name) })
