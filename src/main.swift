@@ -276,15 +276,13 @@ func connect(_ p: Profile) -> ActionResult {
     add("Perfect Forward Secrecy", p.pfs)
     add("NAT Traversal Mode", p.natMode)
     add("Vendor", p.vendor)
-    add("Interface mode", p.ifmode)
     add("Domain", p.domain)
-    add("Application version", p.appVersion)
-    add("Local Addr", p.localAddr)
-    add("Local Port", p.localPort)
-    add("Cisco UDP Encapsulation Port", p.udpPort)
     add("Interface MTU", p.mtu)
     add("DPD idle timeout (our side)", p.dpdTimeout)
     add("Debug", p.debug)
+    // Interface mode is intentionally not set — vpnc defaults to tun, which our
+    // build opens as a native utun. App version / Local Addr / Local Port / UDP
+    // Encap Port are left to vpnc's automatic defaults.
     // Boolean directives (each takes no value). Weak encryption defaults ON.
     if p.enableWeak ?? true { lines.append("Enable weak encryption") }
     if p.singleDES ?? false { lines.append("Enable Single DES") }
@@ -779,21 +777,15 @@ final class ProfileEditor: NSObject {
     let pfsPopup = NSPopUpButton()
     let nattPopup = NSPopUpButton()
     let vendorPopup = NSPopUpButton()
-    let ifmodePopup = NSPopUpButton()
     let debugPopup = NSPopUpButton()
     let domainField = NSTextField()
     let dnsField = NSTextField()
-    let appVersionField = NSTextField()
-    let localAddrField = NSTextField()
-    let localPortField = NSTextField()
-    let udpPortField = NSTextField()
     let mtuField = NSTextField()
     let dpdField = NSTextField()
     let weakCheck = NSButton(checkboxWithTitle: "Enable weak encryption (3DES)", target: nil, action: nil)
     let singleDESCheck = NSButton(checkboxWithTitle: "Enable single DES", target: nil, action: nil)
     let noEncCheck = NSButton(checkboxWithTitle: "Enable no encryption", target: nil, action: nil)
     let weakAuthCheck = NSButton(checkboxWithTitle: "Enable weak authentication", target: nil, action: nil)
-    let extraView = NSTextView()
     let onSave: (Profile, String?, String?) -> Void
     let existing: Profile?
 
@@ -814,17 +806,15 @@ final class ProfileEditor: NSObject {
         passwordField.placeholderString = profile == nil ? "Xauth password" : "leave blank to keep existing"
         nameField.placeholderString = "work"
         gatewayField.placeholderString = "vpn.example.com"
-        idField.placeholderString = "GROUPNAME"
+        idField.placeholderString = "group name"
         userField.placeholderString = "your.username"
         domainField.stringValue = profile?.domain ?? ""
         dnsField.stringValue = profile?.dnsMatchDomains ?? ""
         dnsField.placeholderString = "corp.example.com (for scoped DNS)"
-        appVersionField.stringValue = profile?.appVersion ?? ""
-        localAddrField.stringValue = profile?.localAddr ?? ""
-        localPortField.stringValue = profile?.localPort ?? ""
-        udpPortField.stringValue = profile?.udpPort ?? ""
         mtuField.stringValue = profile?.mtu ?? ""
+        mtuField.placeholderString = "1412 (vpnc default)"
         dpdField.stringValue = profile?.dpdTimeout ?? ""
+        dpdField.placeholderString = "300 (vpnc default)"
 
         func fill(_ p: NSPopUpButton, _ items: [String], _ value: String?) {
             p.removeAllItems()
@@ -836,7 +826,6 @@ final class ProfileEditor: NSObject {
         fill(pfsPopup, ["nopfs", "dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18", "server"], profile?.pfs)
         fill(nattPopup, ["natt", "none", "force-natt", "cisco-udp"], profile?.natMode)
         fill(vendorPopup, ["cisco", "netscreen", "fortigate"], profile?.vendor)
-        fill(ifmodePopup, ["tun", "tap"], profile?.ifmode)
         fill(debugPopup, ["0", "1", "2", "3", "99"], profile?.debug)
 
         weakCheck.state = (profile?.enableWeak ?? true) ? .on : .off    // 3DES on by default
@@ -849,44 +838,25 @@ final class ProfileEditor: NSObject {
         encStack.alignment = .leading
         encStack.spacing = 4
 
-        // Free-form directives box.
-        extraView.isRichText = false
-        extraView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        extraView.isVerticallyResizable = true
-        extraView.textContainer?.widthTracksTextView = true
-        extraView.string = (profile?.extra ?? []).joined(separator: "\n")
-        let extraScroll = NSScrollView()
-        extraScroll.borderType = .bezelBorder
-        extraScroll.hasVerticalScroller = true
-        extraScroll.documentView = extraView
-        extraScroll.translatesAutoresizingMaskIntoConstraints = false
-        extraScroll.heightAnchor.constraint(equalToConstant: 64).isActive = true
-
         func label(_ s: String) -> NSTextField { NSTextField(labelWithString: s) }
         let grid = NSGridView(views: [
             [label("Name"), nameField],
             [label("Gateway"), gatewayField],
-            [label("IPSec ID"), idField],
-            [label("Username"), userField],
+            [label("Group name"), idField],
             [label("Group secret"), secretField],
+            [label("Username"), userField],
             [label("Password"), passwordField],
+            [label("Domain"), domainField],
+            [label("DNS domains"), dnsField],
             [label("IKE Authmode"), authmodePopup],
             [label("DH Group"), dhPopup],
             [label("PFS"), pfsPopup],
             [label("NAT-T Mode"), nattPopup],
             [label("Vendor"), vendorPopup],
-            [label("Interface mode"), ifmodePopup],
-            [label("Domain"), domainField],
-            [label("DNS domains"), dnsField],
-            [label("App version"), appVersionField],
-            [label("Local Addr"), localAddrField],
-            [label("Local Port"), localPortField],
-            [label("UDP Encap Port"), udpPortField],
             [label("Interface MTU"), mtuField],
             [label("DPD timeout"), dpdField],
             [label("Debug level"), debugPopup],
             [label("Encryption"), encStack],
-            [label("Extra"), extraScroll],
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.rowSpacing = 8
@@ -894,9 +864,8 @@ final class ProfileEditor: NSObject {
         grid.translatesAutoresizingMaskIntoConstraints = false
 
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
-            passwordField, domainField, dnsField, appVersionField, localAddrField, localPortField,
-            udpPortField, mtuField, dpdField, authmodePopup, dhPopup, pfsPopup, nattPopup,
-            vendorPopup, ifmodePopup, debugPopup, extraScroll]
+            passwordField, domainField, dnsField, mtuField, dpdField,
+            authmodePopup, dhPopup, pfsPopup, nattPopup, vendorPopup, debugPopup]
         for v in fixedWidth {
             v.translatesAutoresizingMaskIntoConstraints = false
             v.widthAnchor.constraint(equalToConstant: 240).isActive = true
@@ -948,27 +917,26 @@ final class ProfileEditor: NSObject {
         let id = idField.stringValue.trimmingCharacters(in: .whitespaces)
         let user = userField.stringValue.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, !gw.isEmpty, !id.isEmpty, !user.isEmpty else {
-            alert("Name, Gateway, IPSec ID and Username are all required.")
+            alert("Name, Gateway, Group name and Username are all required.")
             return
         }
         func pv(_ p: NSPopUpButton) -> String? { p.indexOfSelectedItem <= 0 ? nil : p.titleOfSelectedItem }
         func tv(_ f: NSTextField) -> String? { ne(f.stringValue) }
-        let extraLines = extraView.string
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
 
+        // ifmode stays nil (we always use native utun). The auto/rarely-needed
+        // fields and any imported "extra" lines are preserved verbatim, just not
+        // exposed in the editor.
         let p = Profile(
             name: name, gateway: gw, id: id, username: user,
             authmode: pv(authmodePopup), dhGroup: pv(dhPopup), pfs: pv(pfsPopup),
-            natMode: pv(nattPopup), vendor: pv(vendorPopup), ifmode: pv(ifmodePopup),
+            natMode: pv(nattPopup), vendor: pv(vendorPopup), ifmode: nil,
             domain: tv(domainField), dnsMatchDomains: tv(dnsField),
-            appVersion: tv(appVersionField), localAddr: tv(localAddrField),
-            localPort: tv(localPortField), udpPort: tv(udpPortField), mtu: tv(mtuField),
+            appVersion: existing?.appVersion, localAddr: existing?.localAddr,
+            localPort: existing?.localPort, udpPort: existing?.udpPort, mtu: tv(mtuField),
             dpdTimeout: tv(dpdField), debug: pv(debugPopup),
             enableWeak: weakCheck.state == .on, singleDES: singleDESCheck.state == .on,
             noEncryption: noEncCheck.state == .on, weakAuth: weakAuthCheck.state == .on,
-            extra: extraLines.isEmpty ? nil : extraLines)
+            extra: existing?.extra)
         let secret = secretField.stringValue.isEmpty ? nil : secretField.stringValue
         let password = passwordField.stringValue.isEmpty ? nil : passwordField.stringValue
         onSave(p, secret, password)
