@@ -11,11 +11,17 @@ let kCiscoDecrypt = "/opt/local/bin/cisco-decrypt"
 let kSecurity = "/usr/bin/security"
 let kSudo = "/usr/bin/sudo"
 let kPgrep = "/usr/bin/pgrep"
+let kPs = "/bin/ps"
+let kVpncScript = "/opt/local/etc/vpnc/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
 
 let configDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/vpncbar")
 let profilesPath = configDir.appendingPathComponent("profiles.json").path
-let activePath = configDir.appendingPathComponent("active").path
+
+// Pidfiles live in a user-creatable, persistent dir (NOT /var/run, which is
+// volatile and root-only). vpnc runs as root but can still write here.
+let pidDir = configDir.appendingPathComponent("run").path
+func pidFile(_ name: String) -> String { "\(pidDir)/\(name).pid" }
 
 // MARK: - Model
 
@@ -32,7 +38,8 @@ struct Profile: Codable {
     var natMode: String? = nil       // NAT Traversal Mode
     var vendor: String? = nil        // Vendor: cisco/netscreen/fortigate
     var ifmode: String? = nil        // Interface mode: tun/tap
-    var domain: String? = nil        // Domain
+    var domain: String? = nil        // Domain (auth/NT domain)
+    var dnsMatchDomains: String? = nil  // scoped-DNS match domains (space/comma separated)
     var appVersion: String? = nil    // Application version
     var localAddr: String? = nil     // Local Addr
     var localPort: String? = nil     // Local Port
@@ -182,15 +189,68 @@ func removeProfile(_ name: String) {
     deleteKeychain(service: "vpnc-\(name)-password")
 }
 
-// MARK: - Connection state
+// MARK: - Connection state (multi-tunnel: one vpnc per profile, keyed by pidfile)
 
-func isConnected() -> Bool { run(kPgrep, ["-x", "vpnc"]).status == 0 }
+func parseEtime(_ s: String) -> Int? {
+    var days = 0
+    var rest = Substring(s)
+    if let dash = s.firstIndex(of: "-") {
+        days = Int(s[..<dash]) ?? 0
+        rest = s[s.index(after: dash)...]
+    }
+    let parts = rest.split(separator: ":").map { Int($0) ?? 0 }
+    switch parts.count {
+    case 3: return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    case 2: return days * 86400 + parts[0] * 60 + parts[1]
+    default: return nil
+    }
+}
 
-func activeProfileName() -> String? {
-    guard isConnected(),
-          let n = try? String(contentsOfFile: activePath, encoding: .utf8) else { return nil }
-    let t = n.trimmingCharacters(in: .whitespacesAndNewlines)
-    return t.isEmpty ? nil : t
+func formatElapsed(_ secs: Int) -> String {
+    let d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60
+    if d > 0 { return "\(d)d \(h)h" }
+    if h > 0 { return "\(h)h \(m)m" }
+    return "\(m)m"
+}
+
+// Elapsed seconds for a live vpnc with this pid, or nil if it isn't a running vpnc.
+func vpncElapsed(pid: Int) -> Int? {
+    let r = run(kPs, ["-p", "\(pid)", "-o", "comm=,etime="])
+    guard r.status == 0 else { return nil }
+    let line = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard line.contains("vpnc"), let etok = line.split(separator: " ").last else { return nil }
+    return parseEtime(String(etok))
+}
+
+// Connected profile name -> (live pid, elapsed seconds). Detected from running
+// vpnc command lines via `ps` (no root file access needed): we read the live PID
+// and the "--pid-file .../<name>.pid" argument to map each daemon to a profile.
+// Falls back to reading the pidfile for any profile not seen in the process list.
+func connectedTunnels(_ names: [String]) -> [String: (pid: Int, secs: Int)] {
+    var result: [String: (pid: Int, secs: Int)] = [:]
+    let r = run(kPs, ["-axo", "pid=,etime=,command="])
+    if r.status == 0 {
+        for raw in r.out.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.contains("/vpnc"), let pf = line.range(of: "--pid-file ") else { continue }
+            guard let pathTok = line[pf.upperBound...].split(separator: " ").first else { continue }
+            let base = (String(pathTok) as NSString).lastPathComponent  // "<name>.pid"
+            guard base.hasSuffix(".pid") else { continue }
+            let name = String(base.dropLast(4))
+            let toks = line.split(separator: " ")
+            guard names.contains(name), toks.count >= 2,
+                  let pid = Int(toks[0]), let secs = parseEtime(String(toks[1])) else { continue }
+            result[name] = (pid, secs)
+        }
+    }
+    for name in names where result[name] == nil {
+        if let s = try? String(contentsOfFile: pidFile(name), encoding: .utf8),
+           let pid = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+           let secs = vpncElapsed(pid: pid) {
+            result[name] = (pid, secs)
+        }
+    }
+    return result
 }
 
 enum ActionResult { case ok, message(String) }
@@ -230,53 +290,60 @@ func connect(_ p: Profile) -> ActionResult {
     if p.singleDES ?? false { lines.append("Enable Single DES") }
     if p.noEncryption ?? false { lines.append("Enable no encryption") }
     if p.weakAuth ?? false { lines.append("Enable weak authentication") }
+
+    // Manual DNS match domains: pass them to the script via an env var prefix on
+    // the "Script" command (vpnc runs it through /bin/sh, so the assignment sticks).
+    // Sanitized to domain-safe chars; commas become spaces. Empty => not added.
+    if let raw = ne(p.dnsMatchDomains) {
+        let domains = String(raw.map { ", ".contains($0) ? " " : $0 })
+            .filter { $0.isLetter || $0.isNumber || ". -_".contains($0) }
+            .split(separator: " ").joined(separator: " ")
+        if !domains.isEmpty {
+            lines.append("Script VPNC_MATCH_DOMAINS='\(domains)' \(kVpncScript)")
+        }
+    }
     lines.append(contentsOf: p.extra ?? [])
     let config = lines.joined(separator: "\n") + "\n"
 
-    let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", "/var/run/vpnc/pid", "-"], stdin: config)
-    if r.status == 0 {
-        try? p.name.write(toFile: activePath, atomically: true, encoding: .utf8)
-        return .ok
-    }
+    // Each profile gets its own pidfile so multiple tunnels can run at once.
+    let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p.name), "-"], stdin: config)
+    if r.status == 0 { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once to allow passwordless vpnc.")
     }
     return .message("vpnc failed (status \(r.status)):\n\(r.err.isEmpty ? r.out : r.err)")
 }
 
-func disconnect() -> ActionResult {
-    let r = run(kSudo, ["-n", kVpncDisconnect])
-    try? FileManager.default.removeItem(atPath: activePath)
+// Disconnect one profile. Prefer the live PID discovered from `ps` (works even
+// if no pidfile was written); fall back to the pidfile path.
+func disconnect(_ name: String) -> ActionResult {
+    let target = connectedTunnels([name])[name].map { "\($0.pid)" } ?? pidFile(name)
+    let r = run(kSudo, ["-n", kVpncDisconnect, target])
     if r.status == 0 || r.out.contains("no vpnc") { return .ok }
-    return .message("disconnect failed:\n\(r.err.isEmpty ? r.out : r.err)")
-}
-
-// Switch to a profile: drop any current tunnel, wait for teardown, then connect.
-func switchTo(_ p: Profile) -> ActionResult {
-    if isConnected() {
-        _ = disconnect()
-        for _ in 0..<30 { if !isConnected() { break }; usleep(100_000) }
+    if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
+        return .message("sudo needs a password.\nRun install-sudoers.sh once.")
     }
-    return connect(p)
+    return .message("disconnect failed:\n\(r.err.isEmpty ? r.out : r.err)")
 }
 
 // MARK: - Profile menu row (left-click connect, right-click edit)
 
 final class ProfileMenuItemView: NSView {
     private let name: String
-    private let checked: Bool
+    private let connected: Bool
+    private let elapsed: String?
     private let onConnect: () -> Void
     private let onEdit: () -> Void
     private var hovered = false
 
-    init(name: String, checked: Bool, onConnect: @escaping () -> Void, onEdit: @escaping () -> Void) {
+    init(name: String, connected: Bool, elapsed: String?, width: CGFloat,
+         onConnect: @escaping () -> Void, onEdit: @escaping () -> Void) {
         self.name = name
-        self.checked = checked
+        self.connected = connected
+        self.elapsed = elapsed
         self.onConnect = onConnect
         self.onEdit = onEdit
-        let font = NSFont.menuFont(ofSize: 0)
-        let textWidth = (name as NSString).size(withAttributes: [.font: font]).width
-        super.init(frame: NSRect(x: 0, y: 0, width: max(180, ceil(textWidth) + 70), height: 22))
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -295,12 +362,19 @@ final class ProfileMenuItemView: NSView {
             NSColor.selectedContentBackgroundColor.setFill()
             bounds.fill()
         }
+        let font = NSFont.menuFont(ofSize: 0)
         let color: NSColor = hovered ? .alternateSelectedControlTextColor : .labelColor
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: color]
-        if checked {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        if connected {
             ("✓" as NSString).draw(at: NSPoint(x: 8, y: 3), withAttributes: attrs)
         }
         (name as NSString).draw(at: NSPoint(x: 24, y: 3), withAttributes: attrs)
+        if let elapsed {
+            let dim: NSColor = hovered ? .alternateSelectedControlTextColor : .secondaryLabelColor
+            let elAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: dim]
+            let w = (elapsed as NSString).size(withAttributes: elAttrs).width
+            (elapsed as NSString).draw(at: NSPoint(x: bounds.width - w - 12, y: 3), withAttributes: elAttrs)
+        }
     }
 
     // Close the menu, then run the action on the next runloop tick — after the
@@ -326,10 +400,10 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var timer: Timer?
     var manageWindow: ManageWindow?
-    private var lastConnected: Bool?      // nil until first poll (no notification at launch)
-    private var lastActiveName: String?   // remembered so we can name it on disconnect
+    private var lastConnected: Set<String>?   // nil until first poll (no notification at launch)
 
     func start() {
+        try? FileManager.default.createDirectory(atPath: pidDir, withIntermediateDirectories: true)
         statusItem.menu = NSMenu()
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -345,24 +419,23 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func refreshState() {
-        let connected = isConnected()
-        let active = activeProfileName()
-        let img = NSImage(systemSymbolName: connected ? "lock.fill" : "lock.open",
+        let profiles = loadProfiles()
+        let tunnels = connectedTunnels(profiles.map { $0.name })
+        let elapsed = tunnels.mapValues { $0.secs }
+        let connected = Set(tunnels.keys)
+
+        let img = NSImage(systemSymbolName: connected.isEmpty ? "lock.open" : "lock.fill",
                           accessibilityDescription: "VPN")
         img?.isTemplate = true
         statusItem.button?.image = img
-        rebuildMenu(connected: connected, active: active)
+        rebuildMenu(profiles: profiles, elapsed: elapsed)
 
-        // Notify on state change only (covers manual + unexpected drops; no double-fire).
+        // Notify per profile on change (covers manual connects + unexpected drops).
         if let prev = lastConnected {
-            if !prev && connected {
-                notify("VPN connected", active.map { "Connected to \($0)." } ?? "")
-            } else if prev && !connected {
-                notify("VPN disconnected", lastActiveName.map { "Disconnected from \($0)." } ?? "")
-            }
+            for name in connected.subtracting(prev) { notify("VPN connected", "Connected to \(name).") }
+            for name in prev.subtracting(connected) { notify("VPN disconnected", "Disconnected from \(name).") }
         }
         lastConnected = connected
-        if connected { lastActiveName = active }
     }
 
     // Shown when notification permission is off, with a shortcut to Settings.
@@ -395,37 +468,40 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
         completionHandler([.banner, .sound])
     }
 
-    func rebuildMenu(connected: Bool, active: String?) {
+    func rebuildMenu(profiles: [Profile], elapsed: [String: Int]) {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
 
-        let header = NSMenuItem(
-            title: connected ? "VPN: Connected\(active.map { " (\($0))" } ?? "")" : "VPN: Disconnected",
-            action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        menu.addItem(.separator())
-
-        let profiles = loadProfiles()
         if profiles.isEmpty {
             let none = NSMenuItem(title: "No VPNs — use Manage VPNs…", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
         } else {
+            // Uniform row width so the elapsed times line up on the right edge.
+            let font = NSFont.menuFont(ofSize: 0)
+            var width: CGFloat = 200
+            for p in profiles {
+                let nameW = (p.name as NSString).size(withAttributes: [.font: font]).width
+                let el = elapsed[p.name].map(formatElapsed) ?? ""
+                let elW = (el as NSString).size(withAttributes: [.font: font]).width
+                width = max(width, 24 + ceil(nameW) + 24 + ceil(elW) + 14)
+            }
             for p in profiles {
                 let item = NSMenuItem()
                 item.view = ProfileMenuItemView(
                     name: p.name,
-                    checked: connected && p.name == active,
-                    onConnect: { [weak self] in self?.selectProfileNamed(p.name) },
+                    connected: elapsed[p.name] != nil,
+                    elapsed: elapsed[p.name].map(formatElapsed),
+                    width: width,
+                    onConnect: { [weak self] in self?.toggleProfile(p.name) },
                     onEdit: { [weak self] in self?.editProfile(p.name) })
                 menu.addItem(item)
             }
         }
 
         menu.addItem(.separator())
-        if connected {
-            let d = NSMenuItem(title: "Disconnect", action: #selector(doDisconnect), keyEquivalent: "d")
+        if !elapsed.isEmpty {
+            let d = NSMenuItem(title: "Disconnect All", action: #selector(doDisconnectAll), keyEquivalent: "d")
             d.target = self
             menu.addItem(d)
         }
@@ -440,12 +516,12 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
-    // Left-click a profile: if it's the connected one, disconnect; otherwise switch to it.
-    func selectProfileNamed(_ name: String) {
-        if isConnected() && name == activeProfileName() {
-            perform { disconnect() }
+    // Left-click a profile: toggle just that tunnel — leaves other tunnels alone.
+    func toggleProfile(_ name: String) {
+        if !connectedTunnels([name]).isEmpty {
+            perform { disconnect(name) }
         } else if let p = loadProfiles().first(where: { $0.name == name }) {
-            perform { switchTo(p) }
+            perform { connect(p) }
         }
     }
 
@@ -462,7 +538,17 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate {
         profileEditor?.window.makeKeyAndOrderFront(nil)
     }
 
-    @objc func doDisconnect() { perform { disconnect() } }
+    @objc func doDisconnectAll() {
+        let names = Array(connectedTunnels(loadProfiles().map { $0.name }).keys)
+        perform {
+            var lastError: ActionResult = .ok
+            for n in names {
+                let r = disconnect(n)
+                if case .message = r { lastError = r }
+            }
+            return lastError
+        }
+    }
 
     func perform(_ action: @escaping () -> ActionResult) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -661,6 +747,7 @@ final class ProfileEditor: NSObject {
     let ifmodePopup = NSPopUpButton()
     let debugPopup = NSPopUpButton()
     let domainField = NSTextField()
+    let dnsField = NSTextField()
     let appVersionField = NSTextField()
     let localAddrField = NSTextField()
     let localPortField = NSTextField()
@@ -695,6 +782,8 @@ final class ProfileEditor: NSObject {
         idField.placeholderString = "GROUPNAME"
         userField.placeholderString = "your.username"
         domainField.stringValue = profile?.domain ?? ""
+        dnsField.stringValue = profile?.dnsMatchDomains ?? ""
+        dnsField.placeholderString = "corp.example.com (for scoped DNS)"
         appVersionField.stringValue = profile?.appVersion ?? ""
         localAddrField.stringValue = profile?.localAddr ?? ""
         localPortField.stringValue = profile?.localPort ?? ""
@@ -753,6 +842,7 @@ final class ProfileEditor: NSObject {
             [label("Vendor"), vendorPopup],
             [label("Interface mode"), ifmodePopup],
             [label("Domain"), domainField],
+            [label("DNS domains"), dnsField],
             [label("App version"), appVersionField],
             [label("Local Addr"), localAddrField],
             [label("Local Port"), localPortField],
@@ -769,7 +859,7 @@ final class ProfileEditor: NSObject {
         grid.translatesAutoresizingMaskIntoConstraints = false
 
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
-            passwordField, domainField, appVersionField, localAddrField, localPortField,
+            passwordField, domainField, dnsField, appVersionField, localAddrField, localPortField,
             udpPortField, mtuField, dpdField, authmodePopup, dhPopup, pfsPopup, nattPopup,
             vendorPopup, ifmodePopup, debugPopup, extraScroll]
         for v in fixedWidth {
@@ -837,7 +927,8 @@ final class ProfileEditor: NSObject {
             name: name, gateway: gw, id: id, username: user,
             authmode: pv(authmodePopup), dhGroup: pv(dhPopup), pfs: pv(pfsPopup),
             natMode: pv(nattPopup), vendor: pv(vendorPopup), ifmode: pv(ifmodePopup),
-            domain: tv(domainField), appVersion: tv(appVersionField), localAddr: tv(localAddrField),
+            domain: tv(domainField), dnsMatchDomains: tv(dnsField),
+            appVersion: tv(appVersionField), localAddr: tv(localAddrField),
             localPort: tv(localPortField), udpPort: tv(udpPortField), mtu: tv(mtuField),
             dpdTimeout: tv(dpdField), debug: pv(debugPopup),
             enableWeak: weakCheck.state == .on, singleDES: singleDESCheck.state == .on,

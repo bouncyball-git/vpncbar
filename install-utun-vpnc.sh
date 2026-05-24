@@ -1,22 +1,25 @@
 #!/bin/sh
-# Install the freshly built utun-capable vpnc over the MacPorts binary that
-# VpncBar and the sudoers rule already point at. Backs up the original once.
+# Install the utun-capable vpnc + patched vpnc-disconnect to /opt/local/sbin.
+# (No MacPorts vpnc remains, so nothing is backed up.)
 # Run with sudo:  sudo ./install-utun-vpnc.sh
 set -e
 
-SRC="$(cd "$(dirname "$0")" && pwd)/vpnc-utun/bin/vpnc"
-DEST="/opt/local/sbin/vpnc"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SRC_VPNC="$HERE/vpnc-utun/bin/vpnc"
+SRC_DISC="$HERE/vpnc-utun/src/vpnc-disconnect"
+SRC_SCRIPT="$HERE/vpnc-script"
 
-[ -f "$SRC" ] || { echo "error: build first — missing $SRC (run: ./build-vpnc.sh)"; exit 1; }
-[ "$(id -u)" = 0 ] || { echo "error: run with sudo"; exit 1; }
+[ -f "$SRC_VPNC" ]   || { echo "error: build first — missing $SRC_VPNC (run: ./build-vpnc.sh)"; exit 1; }
+[ -f "$SRC_DISC" ]   || { echo "error: missing $SRC_DISC"; exit 1; }
+[ -f "$SRC_SCRIPT" ] || { echo "error: missing $SRC_SCRIPT"; exit 1; }
+[ "$(id -u)" = 0 ]   || { echo "error: run with sudo"; exit 1; }
 
-if [ ! -f "$DEST.macports.bak" ]; then
-    cp -p "$DEST" "$DEST.macports.bak"
-    echo "backed up original  -> $DEST.macports.bak"
-fi
+install -d /opt/local/sbin
+install -m 755 "$SRC_VPNC" /opt/local/sbin/vpnc            && echo "installed -> /opt/local/sbin/vpnc"
+install -m 755 "$SRC_DISC" /opt/local/sbin/vpnc-disconnect && echo "installed -> /opt/local/sbin/vpnc-disconnect"
 
-cp "$SRC" "$DEST"
-chmod 755 "$DEST"
-echo "installed utun vpnc -> $DEST"
-"$DEST" --version | head -1
-echo "To revert: sudo cp $DEST.macports.bak $DEST"
+# Network-config script (our copy: never modifies the system default route).
+install -d /opt/local/etc/vpnc
+install -m 755 "$SRC_SCRIPT" /opt/local/etc/vpnc/vpnc-script && echo "installed -> /opt/local/etc/vpnc/vpnc-script"
+
+/opt/local/sbin/vpnc --version | head -1
