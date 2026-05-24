@@ -197,6 +197,22 @@ func removeProfile(_ name: String) {
     deleteKeychain(service: "vpnc-\(name)-password")
 }
 
+// Save an edited profile. If the name changed, this is a rename: migrate any
+// Keychain secrets that weren't re-entered to the new name, then drop the old
+// profile — so renaming moves the entry instead of duplicating it.
+func saveProfileEdit(old: Profile?, new: Profile, secret: String?, password: String?) {
+    if let old, old.name != new.name {
+        if secret == nil, let s = keychainSecret("vpnc-\(old.name)-secret") {
+            storeKeychain(service: "vpnc-\(new.name)-secret", account: new.id, value: s)
+        }
+        if password == nil, let pw = keychainSecret("vpnc-\(old.name)-password") {
+            storeKeychain(service: "vpnc-\(new.name)-password", account: new.username, value: pw)
+        }
+        removeProfile(old.name)   // also deletes the old Keychain entries
+    }
+    upsert(new, secret: secret, password: password)
+}
+
 // MARK: - Connection state (multi-tunnel: one vpnc per profile, keyed by pidfile)
 
 func parseEtime(_ s: String) -> Int? {
@@ -604,7 +620,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     func editProfile(_ name: String) {
         guard let p = loadProfiles().first(where: { $0.name == name }) else { return }
         profileEditor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
-            upsert(prof, secret: secret, password: password)
+            saveProfileEdit(old: p, new: prof, secret: secret, password: password)
             self?.refreshState()
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -803,7 +819,7 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     func presentEditor(_ p: Profile?) {
         editor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
-            upsert(prof, secret: secret, password: password)
+            saveProfileEdit(old: p, new: prof, secret: secret, password: password)
             self?.reload()
         }
         window.beginSheet(editor!.window)
