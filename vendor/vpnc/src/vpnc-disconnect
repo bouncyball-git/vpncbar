@@ -1,0 +1,32 @@
+#!/bin/sh
+# vpnc-disconnect [pidfile | pid]
+#
+# Terminate a vpnc daemon. The argument may be a pidfile path (default
+# /var/run/vpnc/pid) OR a numeric PID. Accepting an argument lets a front-end
+# run several tunnels at once and disconnect them individually.
+
+arg="${1:-/var/run/vpnc/pid}"
+
+case "$arg" in
+	'' | *[!0-9]*) PID="$(cat "$arg" 2>/dev/null)" ;;  # not all digits -> pidfile path
+	*)             PID="$arg" ;;                        # all digits -> a PID
+esac
+
+if [ -z "$PID" ]; then
+	echo "no vpnc found running"
+	exit 1
+fi
+
+if ! kill -0 "$PID" >/dev/null 2>&1; then
+	echo "no vpnc found running"
+	exit 1
+fi
+
+# Safety: only signal the PID if it really is a vpnc process.
+if ! ps -p "$PID" -o comm= 2>/dev/null | grep -q vpnc; then
+	echo "pid $PID is not a vpnc process; refusing to kill" 1>&2
+	exit 1
+fi
+
+echo "Terminating vpnc daemon (pid: $PID)"
+exec kill "$PID"
