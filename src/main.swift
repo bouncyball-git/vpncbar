@@ -376,17 +376,20 @@ func connect(_ p: Profile) -> ActionResult {
     if p.noEncryption ?? false { lines.append("Enable no encryption") }
     if p.weakAuth ?? false { lines.append("Enable weak authentication") }
 
-    // Manual DNS match domains: pass them to the script via an env var prefix on
-    // the "Script" command (vpnc runs it through /bin/sh, so the assignment sticks).
-    // Sanitized to domain-safe chars; commas become spaces. Empty => not added.
+    // Run our script with env vars prefixed on the "Script" command (vpnc runs it
+    // via /bin/sh, so the assignments stick — for connect AND disconnect, since vpnc
+    // reuses this command). VPNPID is pinned to the profile uuid so the script's temp
+    // files (resolv.conf-backup, defaultroute) are keyed consistently across connect
+    // and disconnect — vpnc's daemonizing fork otherwise changes the derived pid and
+    // orphans the backups. VPNC_MATCH_DOMAINS carries the scoped-DNS domains.
+    var scriptCmd = "VPNPID='\(p.uuid ?? p.name)'"
     if let raw = ne(p.dnsMatchDomains) {
         let domains = String(raw.map { ", ".contains($0) ? " " : $0 })
             .filter { $0.isLetter || $0.isNumber || ". -_".contains($0) }
             .split(separator: " ").joined(separator: " ")
-        if !domains.isEmpty {
-            lines.append("Script VPNC_MATCH_DOMAINS='\(domains)' \(kVpncScript)")
-        }
+        if !domains.isEmpty { scriptCmd += " VPNC_MATCH_DOMAINS='\(domains)'" }
     }
+    lines.append("Script \(scriptCmd) \(kVpncScript)")
     lines.append(contentsOf: p.extra ?? [])
     let config = lines.joined(separator: "\n") + "\n"
 
