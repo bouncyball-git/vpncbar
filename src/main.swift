@@ -26,7 +26,8 @@ func pidFile(_ name: String) -> String { "\(pidDir)/\(name).pid" }
 // MARK: - Model
 
 struct Profile: Codable {
-    var name: String          // keychain prefix: vpnc-<name>-secret / -password
+    var uuid: String? = nil   // stable identity; Keychain keys off this, so renames are cosmetic
+    var name: String          // display label
     var gateway: String       // IPSec gateway
     var id: String            // IPSec ID (group name)
     var username: String      // Xauth username
@@ -181,36 +182,53 @@ func parseConfigFile(_ path: String) -> ParsedConfig? {
         password: blank(password) ? nil : password)
 }
 
-// Persist a profile + (optional) secrets. Replaces any profile with the same name.
-func upsert(_ p: Profile, secret: String?, password: String?) {
-    var list = loadProfiles().filter { $0.name != p.name }
+// Keychain service for a profile's secret/password. Keyed off the stable uuid
+// (falling back to name only for not-yet-migrated entries), so renaming a profile
+// never changes the key — no migration, no duplicate, no lost secret.
+func kcService(_ p: Profile, _ kind: String) -> String { "vpnc-\(p.uuid ?? p.name)-\(kind)" }
+
+// Persist a profile + (optional) secrets, keyed by uuid. A new profile gets a
+// uuid here; an edited one keeps its uuid, so this replaces it in place even if
+// the name changed.
+@discardableResult
+func upsert(_ profile: Profile, secret: String?, password: String?) -> Profile {
+    var p = profile
+    if p.uuid == nil { p.uuid = UUID().uuidString }
+    var list = loadProfiles().filter { $0.uuid != p.uuid }
     list.append(p)
-    list.sort { $0.name < $1.name }
+    list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     saveProfiles(list)
-    if let secret, !secret.isEmpty { storeKeychain(service: "vpnc-\(p.name)-secret", account: p.id, value: secret) }
-    if let password, !password.isEmpty { storeKeychain(service: "vpnc-\(p.name)-password", account: p.username, value: password) }
+    if let secret, !secret.isEmpty { storeKeychain(service: kcService(p, "secret"), account: p.id, value: secret) }
+    if let password, !password.isEmpty { storeKeychain(service: kcService(p, "password"), account: p.username, value: password) }
+    return p
 }
 
-func removeProfile(_ name: String) {
-    saveProfiles(loadProfiles().filter { $0.name != name })
-    deleteKeychain(service: "vpnc-\(name)-secret")
-    deleteKeychain(service: "vpnc-\(name)-password")
+func removeProfile(_ p: Profile) {
+    saveProfiles(loadProfiles().filter { $0.uuid != p.uuid })
+    deleteKeychain(service: kcService(p, "secret"))
+    deleteKeychain(service: kcService(p, "password"))
 }
 
-// Save an edited profile. If the name changed, this is a rename: migrate any
-// Keychain secrets that weren't re-entered to the new name, then drop the old
-// profile — so renaming moves the entry instead of duplicating it.
-func saveProfileEdit(old: Profile?, new: Profile, secret: String?, password: String?) {
-    if let old, old.name != new.name {
-        if secret == nil, let s = keychainSecret("vpnc-\(old.name)-secret") {
-            storeKeychain(service: "vpnc-\(new.name)-secret", account: new.id, value: s)
+// One-time migration: give every profile a uuid and move its name-based Keychain
+// items (vpnc-<name>-…) to uuid-based ones (vpnc-<uuid>-…).
+func migrateProfilesToUUID() {
+    var list = loadProfiles()
+    var changed = false
+    for i in list.indices where list[i].uuid == nil {
+        let id = UUID().uuidString
+        let name = list[i].name
+        if let s = keychainSecret("vpnc-\(name)-secret") {
+            storeKeychain(service: "vpnc-\(id)-secret", account: list[i].id, value: s)
+            deleteKeychain(service: "vpnc-\(name)-secret")
         }
-        if password == nil, let pw = keychainSecret("vpnc-\(old.name)-password") {
-            storeKeychain(service: "vpnc-\(new.name)-password", account: new.username, value: pw)
+        if let pw = keychainSecret("vpnc-\(name)-password") {
+            storeKeychain(service: "vpnc-\(id)-password", account: list[i].username, value: pw)
+            deleteKeychain(service: "vpnc-\(name)-password")
         }
-        removeProfile(old.name)   // also deletes the old Keychain entries
+        list[i].uuid = id
+        changed = true
     }
-    upsert(new, secret: secret, password: password)
+    if changed { saveProfiles(list) }
 }
 
 // MARK: - Connection state (multi-tunnel: one vpnc per profile, keyed by pidfile)
@@ -312,10 +330,10 @@ func connect(_ p: Profile) -> ActionResult {
     // (a duplicate would fight over the same pidfile and re-resolve the gateway).
     if !connectedTunnels([p.name]).isEmpty { return .ok }
 
-    guard let secret = keychainSecret("vpnc-\(p.name)-secret") else {
+    guard let secret = keychainSecret(kcService(p, "secret")) else {
         return .message("Group secret not found in Keychain for “\(p.name)”.\nOpen Manage VPNs and set it.")
     }
-    let password = keychainSecret("vpnc-\(p.name)-password")
+    let password = keychainSecret(kcService(p, "password"))
     // The Username field may hold "DOMAIN\user"; send the domain via vpnc's
     // Domain directive and the bare user via Xauth username.
     let (xauthDomain, xauthUser) = splitDomainUser(p.username)
@@ -463,6 +481,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
 
     func start() {
         try? FileManager.default.createDirectory(atPath: pidDir, withIntermediateDirectories: true)
+        migrateProfilesToUUID()   // give existing profiles a stable uuid + move their Keychain items
         statusItem.menu = NSMenu()
         statusItem.menu?.delegate = self
         let center = UNUserNotificationCenter.current()
@@ -620,7 +639,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     func editProfile(_ name: String) {
         guard let p = loadProfiles().first(where: { $0.name == name }) else { return }
         profileEditor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
-            saveProfileEdit(old: p, new: prof, secret: secret, password: password)
+            upsert(prof, secret: secret, password: password)
             self?.refreshState()
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -796,14 +815,14 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
     @objc func removeSelected() {
         guard table.selectedRow >= 0 else { return }
-        let name = profiles[table.selectedRow].name
+        let p = profiles[table.selectedRow]
         let a = NSAlert()
-        a.messageText = "Remove “\(name)”?"
+        a.messageText = "Remove “\(p.name)”?"
         a.informativeText = "This deletes the profile and its Keychain secrets."
         a.addButton(withTitle: "Remove")
         a.addButton(withTitle: "Cancel")
         if a.runModal() == .alertFirstButtonReturn {
-            removeProfile(name)
+            removeProfile(p)
             reload()
         }
     }
@@ -819,7 +838,7 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     func presentEditor(_ p: Profile?) {
         editor = ProfileEditor(profile: p) { [weak self] prof, secret, password in
-            saveProfileEdit(old: p, new: prof, secret: secret, password: password)
+            upsert(prof, secret: secret, password: password)
             self?.reload()
         }
         window.beginSheet(editor!.window)
@@ -831,14 +850,73 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 /// Top-origin view so the scrolled form starts at the top, not the bottom.
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
+/// A password field with an eye toggle to reveal/hide the value. Internally swaps
+/// a masked NSSecureTextField with a plain NSTextField, keeping their value in sync.
+final class RevealableSecureField: NSView {
+    private let secure = NSSecureTextField()
+    private let plain = NSTextField()
+    private let eye = NSButton()
+    private var revealed = false
+
+    var stringValue: String {
+        get { revealed ? plain.stringValue : secure.stringValue }
+        set { secure.stringValue = newValue; plain.stringValue = newValue }
+    }
+    var placeholderString: String? {
+        get { secure.placeholderString }
+        set { secure.placeholderString = newValue; plain.placeholderString = newValue }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        for f in [secure, plain] { f.translatesAutoresizingMaskIntoConstraints = false }
+        plain.isHidden = true
+        eye.translatesAutoresizingMaskIntoConstraints = false
+        eye.isBordered = false
+        eye.bezelStyle = .regularSquare
+        eye.setButtonType(.momentaryChange)
+        eye.imagePosition = .imageOnly
+        eye.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "Show")
+        eye.contentTintColor = .secondaryLabelColor
+        eye.refusesFirstResponder = true
+        eye.target = self
+        eye.action = #selector(toggle)
+        // Fields fill the width; the eye is overlaid INSIDE the field's right edge
+        // (added last so it sits on top and receives the click).
+        addSubview(secure); addSubview(plain); addSubview(eye)
+        NSLayoutConstraint.activate([
+            secure.leadingAnchor.constraint(equalTo: leadingAnchor),
+            secure.trailingAnchor.constraint(equalTo: trailingAnchor),
+            secure.centerYAnchor.constraint(equalTo: centerYAnchor),
+            plain.leadingAnchor.constraint(equalTo: leadingAnchor),
+            plain.trailingAnchor.constraint(equalTo: trailingAnchor),
+            plain.centerYAnchor.constraint(equalTo: centerYAnchor),
+            eye.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            eye.centerYAnchor.constraint(equalTo: centerYAnchor),
+            eye.widthAnchor.constraint(equalToConstant: 18),
+            eye.heightAnchor.constraint(equalToConstant: 16),
+            heightAnchor.constraint(equalToConstant: 22),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func toggle() {
+        if revealed { secure.stringValue = plain.stringValue } else { plain.stringValue = secure.stringValue }
+        revealed.toggle()
+        secure.isHidden = revealed
+        plain.isHidden = !revealed
+        eye.image = NSImage(systemSymbolName: revealed ? "eye.slash" : "eye", accessibilityDescription: nil)
+    }
+}
+
 final class ProfileEditor: NSObject {
     let window: NSWindow
     let nameField = NSTextField()
     let gatewayField = NSTextField()
     let idField = NSTextField()
     let userField = NSTextField()
-    let secretField = NSSecureTextField()
-    let passwordField = NSSecureTextField()
+    let secretField = RevealableSecureField()
+    let passwordField = RevealableSecureField()
     let authmodePopup = NSPopUpButton()
     let dhPopup = NSPopUpButton()
     let pfsPopup = NSPopUpButton()
@@ -874,8 +952,11 @@ final class ProfileEditor: NSObject {
         } else {
             userField.stringValue = profile?.username ?? ""
         }
-        secretField.placeholderString = profile == nil ? "shared group secret" : "leave blank to keep existing"
-        passwordField.placeholderString = profile == nil ? "Xauth password" : "leave blank to keep existing"
+        // Prefill stored secrets so a configured field shows dots ("••••"); the eye reveals them.
+        secretField.stringValue = profile.flatMap { keychainSecret(kcService($0, "secret")) } ?? ""
+        passwordField.stringValue = profile.flatMap { keychainSecret(kcService($0, "password")) } ?? ""
+        secretField.placeholderString = "shared group secret"
+        passwordField.placeholderString = "Xauth password"
         nameField.placeholderString = "work"
         gatewayField.placeholderString = "vpn.example.com"
         idField.placeholderString = "group name"
@@ -997,6 +1078,7 @@ final class ProfileEditor: NSObject {
         // fields and any imported "extra" lines are preserved verbatim, just not
         // exposed in the editor.
         let p = Profile(
+            uuid: existing?.uuid,   // keep identity on edit; upsert assigns one for a new profile
             name: name, gateway: gw, id: id, username: user,
             authmode: pv(authmodePopup), dhGroup: pv(dhPopup), pfs: pv(pfsPopup),
             natMode: pv(nattPopup), vendor: pv(vendorPopup), ifmode: nil,
