@@ -679,11 +679,6 @@ search $DOMAINS"
 						d.add SupplementalMatchDomains * $MATCH_DOMAINS
 						d.add SearchDomains * $MATCH_DOMAINS
 						set State:/Network/Service/$TUNDEV/DNS
-						d.init
-						d.add Addresses * $INTERNAL_IP4_ADDRESS
-						d.add SubnetMasks * 255.255.255.255
-						d.add InterfaceName $TUNDEV
-						set State:/Network/Service/$TUNDEV/IPv4
 						close
 					EOF
 				fi

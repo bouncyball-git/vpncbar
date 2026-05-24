@@ -397,7 +397,7 @@ final class ProfileMenuItemView: NSView {
 
 // MARK: - Menu-bar controller
 
-final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDelegate {
+final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDelegate, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var timer: Timer?
     var tickTimer: Timer?     // 1s redraw of elapsed times, only while the menu is open
@@ -572,6 +572,16 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
                 if case .message = r { lastError = r }
             }
             return lastError
+        }
+    }
+
+    // Quit without orphaning tunnels: disconnect every one synchronously before
+    // we exit. Each disconnect sends SIGTERM to vpnc, which runs the script's
+    // teardown (restoring its routes/DNS) — graceful even though vpnc outlives us.
+    func applicationWillTerminate(_ notification: Notification) {
+        tickTimer?.invalidate()
+        for name in connectedTunnels(loadProfiles().map { $0.name }).keys {
+            _ = disconnect(name)
         }
     }
 
@@ -978,5 +988,6 @@ final class ProfileEditor: NSObject {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // menu-bar only, no dock icon
 let controller = AppController()
+app.delegate = controller             // so applicationWillTerminate disconnects tunnels
 controller.start()
 app.run()
