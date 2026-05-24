@@ -1,9 +1,26 @@
 #!/bin/sh
-# vpnc-disconnect [pidfile | pid]
+# vpnc-disconnect [pidfile | pid | sweep]
 #
 # Terminate a vpnc daemon. The argument may be a pidfile path (default
 # /var/run/vpnc/pid) OR a numeric PID. Accepting an argument lets a front-end
 # run several tunnels at once and disconnect them individually.
+#
+# "sweep" instead removes config left behind by a vpnc that died WITHOUT running
+# its disconnect (crash / kill -9): scoped DNS and routes bound to a utun
+# interface that no longer exists. A clean disconnect already undoes its own.
+
+if [ "$1" = "sweep" ]; then
+	# Orphaned scoped DNS (dynamic-store entries for vanished utun interfaces).
+	for k in `echo 'list State:/Network/Service/[^/]+/DNS' | scutil 2>/dev/null | grep -oE 'State:/Network/Service/utun[0-9]+/DNS'`; do
+		dev=`echo "$k" | sed -E 's#.*/(utun[0-9]+)/DNS#\1#'`
+		ifconfig "$dev" >/dev/null 2>&1 || printf 'open\nremove %s\nclose\n' "$k" | scutil >/dev/null 2>&1
+	done
+	# Orphaned IPv4 routes whose interface is a utun that no longer exists.
+	netstat -rn -f inet 2>/dev/null | awk '$NF ~ /^utun[0-9]+$/ { print $1, $NF }' | while read net dev; do
+		ifconfig "$dev" >/dev/null 2>&1 || route -n delete "$net" >/dev/null 2>&1
+	done
+	exit 0
+fi
 
 arg="${1:-/var/run/vpnc/pid}"
 

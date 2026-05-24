@@ -60,6 +60,14 @@ func ne(_ s: String?) -> String? {
     return t
 }
 
+// Split "DOMAIN\user" into (domain, user); a plain "user" yields (nil, "user").
+func splitDomainUser(_ s: String) -> (domain: String?, user: String) {
+    guard let r = s.range(of: "\\") else { return (nil, s) }
+    let d = s[..<r.lowerBound].trimmingCharacters(in: .whitespaces)
+    let u = s[r.upperBound...].trimmingCharacters(in: .whitespaces)
+    return (d.isEmpty ? nil : d, u)
+}
+
 func loadProfiles() -> [Profile] {
     guard let data = FileManager.default.contents(atPath: profilesPath),
           let list = try? JSONDecoder().decode([Profile].self, from: data) else { return [] }
@@ -255,18 +263,54 @@ func connectedTunnels(_ names: [String]) -> [String: (pid: Int, secs: Int)] {
 
 enum ActionResult { case ok, message(String) }
 
+// Last good gateway-hostname → IP lookup, so a reconnect still works even if a
+// stale scoped resolver is lingering and would route the gateway to the VPN DNS.
+var gatewayIPCache: [String: String] = [:]
+
+// Resolve the gateway to an IPv4 literal via the system resolver. We hand vpnc an
+// IP (not the hostname) so the gateway never depends on DNS — immune to having its
+// own domain scoped to the VPN's internal DNS (which doesn't know the public host).
+func resolveGatewayIP(_ host: String) -> String {
+    var a4 = in_addr()
+    if host.withCString({ inet_pton(AF_INET, $0, &a4) }) == 1 { return host }  // already an IP
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_DGRAM
+    var res: UnsafeMutablePointer<addrinfo>?
+    if getaddrinfo(host, nil, &hints, &res) == 0, let info = res {
+        defer { freeaddrinfo(res) }
+        if let sa = info.pointee.ai_addr {
+            var addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN))
+            let ip = String(cString: buf)
+            gatewayIPCache[host] = ip
+            return ip
+        }
+    }
+    return gatewayIPCache[host] ?? host   // fall back to last good IP, else the hostname
+}
+
 func connect(_ p: Profile) -> ActionResult {
+    // Safeguard: never launch a second vpnc for a profile that's already up
+    // (a duplicate would fight over the same pidfile and re-resolve the gateway).
+    if !connectedTunnels([p.name]).isEmpty { return .ok }
+
     guard let secret = keychainSecret("vpnc-\(p.name)-secret") else {
         return .message("Group secret not found in Keychain for “\(p.name)”.\nOpen Manage VPNs and set it.")
     }
     let password = keychainSecret("vpnc-\(p.name)-password")
+    // The Username field may hold "DOMAIN\user"; send the domain via vpnc's
+    // Domain directive and the bare user via Xauth username.
+    let (xauthDomain, xauthUser) = splitDomainUser(p.username)
     var lines = [
-        "IPSec gateway \(p.gateway)",
+        "IPSec gateway \(resolveGatewayIP(p.gateway))",
         "IPSec ID \(p.id)",
         "IPSec secret \(secret)",
         "IKE Authmode \(ne(p.authmode) ?? "psk")",
-        "Xauth username \(p.username)",
+        "Xauth username \(xauthUser)",
     ]
+    if let xauthDomain { lines.append("Domain \(xauthDomain)") }
     if let password { lines.append("Xauth password \(password)") }
 
     func add(_ key: String, _ value: String?) {
@@ -276,7 +320,6 @@ func connect(_ p: Profile) -> ActionResult {
     add("Perfect Forward Secrecy", p.pfs)
     add("NAT Traversal Mode", p.natMode)
     add("Vendor", p.vendor)
-    add("Domain", p.domain)
     add("Interface MTU", p.mtu)
     add("DPD idle timeout (our side)", p.dpdTimeout)
     add("Debug", p.debug)
@@ -434,7 +477,15 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
         // Notify per profile on change (covers manual connects + unexpected drops).
         if let prev = lastConnected {
             for name in connected.subtracting(prev) { notify("VPN connected", "Connected to \(name).") }
-            for name in prev.subtracting(connected) { notify("VPN disconnected", "Disconnected from \(name).") }
+            let closed = prev.subtracting(connected)
+            for name in closed { notify("VPN disconnected", "Disconnected from \(name).") }
+            // When any tunnel closes, sweep config a crashed vpnc may have left
+            // behind (orphaned scoped DNS + routes on a now-gone utun).
+            if !closed.isEmpty {
+                DispatchQueue.global(qos: .utility).async {
+                    _ = run(kSudo, ["-n", kVpncDisconnect, "sweep"])
+                }
+            }
         }
         lastConnected = connected
     }
@@ -524,14 +575,14 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
 
         menu.addItem(.separator())
         if !elapsed.isEmpty {
-            let d = NSMenuItem(title: "Disconnect All", action: #selector(doDisconnectAll), keyEquivalent: "d")
+            let d = NSMenuItem(title: "Disconnect All", action: #selector(doDisconnectAll), keyEquivalent: "")
             d.target = self
             menu.addItem(d)
         }
-        let m = NSMenuItem(title: "Manage VPNs…", action: #selector(openManage), keyEquivalent: ",")
+        let m = NSMenuItem(title: "Manage VPNs…", action: #selector(openManage), keyEquivalent: "")
         m.target = self
         menu.addItem(m)
-        let imp = NSMenuItem(title: "Import Config…", action: #selector(importConfig), keyEquivalent: "i")
+        let imp = NSMenuItem(title: "Import Config…", action: #selector(importConfig), keyEquivalent: "")
         imp.target = self
         menu.addItem(imp)
         menu.addItem(.separator())
@@ -778,7 +829,6 @@ final class ProfileEditor: NSObject {
     let nattPopup = NSPopUpButton()
     let vendorPopup = NSPopUpButton()
     let debugPopup = NSPopUpButton()
-    let domainField = NSTextField()
     let dnsField = NSTextField()
     let mtuField = NSTextField()
     let dpdField = NSTextField()
@@ -792,7 +842,7 @@ final class ProfileEditor: NSObject {
     init(profile: Profile?, onSave: @escaping (Profile, String?, String?) -> Void) {
         self.onSave = onSave
         self.existing = profile
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 560),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 710),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = profile == nil ? "Add VPN" : "Edit VPN"
         window.isReleasedWhenClosed = false   // we retain it; let ARC free it
@@ -801,32 +851,37 @@ final class ProfileEditor: NSObject {
         nameField.stringValue = profile?.name ?? ""
         gatewayField.stringValue = profile?.gateway ?? ""
         idField.stringValue = profile?.id ?? ""
-        userField.stringValue = profile?.username ?? ""
+        // Username may carry a domain as "DOMAIN\user". Fold any legacy separate
+        // domain back into the field so old profiles display correctly.
+        if let d = ne(profile?.domain) {
+            userField.stringValue = "\(d)\\\(profile?.username ?? "")"
+        } else {
+            userField.stringValue = profile?.username ?? ""
+        }
         secretField.placeholderString = profile == nil ? "shared group secret" : "leave blank to keep existing"
         passwordField.placeholderString = profile == nil ? "Xauth password" : "leave blank to keep existing"
         nameField.placeholderString = "work"
         gatewayField.placeholderString = "vpn.example.com"
         idField.placeholderString = "group name"
-        userField.placeholderString = "your.username"
-        domainField.stringValue = profile?.domain ?? ""
+        userField.placeholderString = "user  or  DOMAIN\\user"
         dnsField.stringValue = profile?.dnsMatchDomains ?? ""
-        dnsField.placeholderString = "corp.example.com (for scoped DNS)"
+        dnsField.placeholderString = "example.com, ..."
         mtuField.stringValue = profile?.mtu ?? ""
-        mtuField.placeholderString = "1412 (vpnc default)"
-        dpdField.stringValue = profile?.dpdTimeout ?? ""
-        dpdField.placeholderString = "300 (vpnc default)"
+        mtuField.placeholderString = "automatic"
+        dpdField.stringValue = profile?.dpdTimeout ?? "30"   // seconds
 
-        func fill(_ p: NSPopUpButton, _ items: [String], _ value: String?) {
+        // Show real values (no "(default)" sentinel); pre-select vpnc's actual default.
+        func fill(_ p: NSPopUpButton, _ items: [String], _ value: String?, _ def: String) {
             p.removeAllItems()
-            p.addItems(withTitles: ["(default)"] + items)
-            if let v = value, p.itemTitles.contains(v) { p.selectItem(withTitle: v) } else { p.selectItem(at: 0) }
+            p.addItems(withTitles: items)
+            p.selectItem(withTitle: (value.flatMap { items.contains($0) ? $0 : nil }) ?? def)
         }
-        fill(authmodePopup, ["psk", "cert", "hybrid"], profile?.authmode)
-        fill(dhPopup, ["dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18"], profile?.dhGroup)
-        fill(pfsPopup, ["nopfs", "dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18", "server"], profile?.pfs)
-        fill(nattPopup, ["natt", "none", "force-natt", "cisco-udp"], profile?.natMode)
-        fill(vendorPopup, ["cisco", "netscreen", "fortigate"], profile?.vendor)
-        fill(debugPopup, ["0", "1", "2", "3", "99"], profile?.debug)
+        fill(authmodePopup, ["psk", "cert", "hybrid"], profile?.authmode, "psk")
+        fill(dhPopup, ["dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18"], profile?.dhGroup, "dh2")
+        fill(pfsPopup, ["nopfs", "dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18", "server"], profile?.pfs, "server")
+        fill(nattPopup, ["natt", "none", "force-natt", "cisco-udp"], profile?.natMode, "natt")
+        fill(vendorPopup, ["cisco", "netscreen", "fortigate"], profile?.vendor, "cisco")
+        fill(debugPopup, ["0", "1", "2", "3", "99"], profile?.debug, "0")
 
         weakCheck.state = (profile?.enableWeak ?? true) ? .on : .off    // 3DES on by default
         singleDESCheck.state = (profile?.singleDES ?? false) ? .on : .off
@@ -846,8 +901,7 @@ final class ProfileEditor: NSObject {
             [label("Group secret"), secretField],
             [label("Username"), userField],
             [label("Password"), passwordField],
-            [label("Domain"), domainField],
-            [label("DNS domains"), dnsField],
+            [label("VPN domains"), dnsField],
             [label("IKE Authmode"), authmodePopup],
             [label("DH Group"), dhPopup],
             [label("PFS"), pfsPopup],
@@ -864,7 +918,7 @@ final class ProfileEditor: NSObject {
         grid.translatesAutoresizingMaskIntoConstraints = false
 
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
-            passwordField, domainField, dnsField, mtuField, dpdField,
+            passwordField, dnsField, mtuField, dpdField,
             authmodePopup, dhPopup, pfsPopup, nattPopup, vendorPopup, debugPopup]
         for v in fixedWidth {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -920,7 +974,7 @@ final class ProfileEditor: NSObject {
             alert("Name, Gateway, Group name and Username are all required.")
             return
         }
-        func pv(_ p: NSPopUpButton) -> String? { p.indexOfSelectedItem <= 0 ? nil : p.titleOfSelectedItem }
+        func pv(_ p: NSPopUpButton) -> String? { p.titleOfSelectedItem }
         func tv(_ f: NSTextField) -> String? { ne(f.stringValue) }
 
         // ifmode stays nil (we always use native utun). The auto/rarely-needed
@@ -930,7 +984,7 @@ final class ProfileEditor: NSObject {
             name: name, gateway: gw, id: id, username: user,
             authmode: pv(authmodePopup), dhGroup: pv(dhPopup), pfs: pv(pfsPopup),
             natMode: pv(nattPopup), vendor: pv(vendorPopup), ifmode: nil,
-            domain: tv(domainField), dnsMatchDomains: tv(dnsField),
+            domain: nil, dnsMatchDomains: tv(dnsField),
             appVersion: existing?.appVersion, localAddr: existing?.localAddr,
             localPort: existing?.localPort, udpPort: existing?.udpPort, mtu: tv(mtuField),
             dpdTimeout: tv(dpdField), debug: pv(debugPopup),
