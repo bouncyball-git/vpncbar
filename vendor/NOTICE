@@ -53,6 +53,16 @@ native "utun" interface instead of the unavailable tuntaposx kext):
   Build: make CRYPTO_NONE=yes SCRIPT_PATH=/opt/local/etc/vpnc/vpnc-script
          (certificate support is omitted; we use PSK + XAUTH only.)
 
+  Certificate auth (IKE Authmode cert/hybrid) is OPTIONAL at build time:
+    - CRYPTO_NONE=yes          -> no TLS/SSL; PSK + XAUTH only (our default build).
+    - (default, no flag)       -> link GnuTLS (LGPL, GPL-compatible) for X.509.
+    - OPENSSL_GPL_VIOLATION=yes -> link OpenSSL instead (its license is GPL-
+                                  incompatible, hence the flag name; fine for
+                                  personal, non-distributed use).
+  The core IKE crypto always uses libgcrypt regardless. VpncBar detects whether
+  the installed vpnc was built with a TLS backend (via `otool -L`) and only
+  offers cert/hybrid auth when it was.
+
 
 vendor/vpnc-script  — network configuration script
 ---------------------------------------------------

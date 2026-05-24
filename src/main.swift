@@ -12,7 +12,19 @@ let kSecurity = "/usr/bin/security"
 let kSudo = "/usr/bin/sudo"
 let kPgrep = "/usr/bin/pgrep"
 let kPs = "/bin/ps"
+let kOtool = "/usr/bin/otool"
 let kVpncScript = "/opt/local/etc/vpnc/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
+
+// Whether the installed vpnc was built with a TLS backend (GnuTLS/OpenSSL), i.e.
+// supports IKE Authmode cert/hybrid. Detected from its linked libraries; cached.
+private var _vpncCerts: Bool? = nil
+func vpncSupportsCerts() -> Bool {
+    if let c = _vpncCerts { return c }
+    let out = run(kOtool, ["-L", kVpnc]).out.lowercased()
+    let c = out.contains("gnutls") || out.contains("libcrypto") || out.contains("libssl")
+    _vpncCerts = c
+    return c
+}
 
 let configDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/vpncbar")
@@ -47,6 +59,8 @@ struct Profile: Codable {
     var ifmode: String? = nil        // Interface mode: tun/tap
     var domain: String? = nil        // Domain (auth/NT domain)
     var dnsMatchDomains: String? = nil  // scoped-DNS match domains (space/comma separated)
+    var caFile: String? = nil        // CA cert path for cert/hybrid auth (CA-File)
+    var clientCert: String? = nil    // client cert path (cert mode; vpnc has no directive yet)
     var appVersion: String? = nil    // Application version
     var localAddr: String? = nil     // Local Addr
     var localPort: String? = nil     // Local Port
@@ -340,20 +354,32 @@ func connect(_ p: Profile) -> ActionResult {
     // (a duplicate would fight over the same pidfile and re-resolve the gateway).
     if !connectedTunnels([p]).isEmpty { return .ok }
 
-    guard let secret = keychainSecret(kcService(p, "secret")) else {
-        return .message("Group secret not found in Keychain for “\(p.name)”.\nOpen Manage VPNs and set it.")
-    }
-    let password = keychainSecret(kcService(p, "password"))
+    let authmode = ne(p.authmode) ?? "psk"
+    let usesCert = (authmode == "cert" || authmode == "hybrid")
+
     // The Username field may hold "DOMAIN\user"; send the domain via vpnc's
     // Domain directive and the bare user via Xauth username.
     let (xauthDomain, xauthUser) = splitDomainUser(p.username)
     var lines = [
         "IPSec gateway \(resolveGatewayIP(p.gateway))",
         "IPSec ID \(p.id)",
-        "IPSec secret \(secret)",
-        "IKE Authmode \(ne(p.authmode) ?? "psk")",
+        "IKE Authmode \(authmode)",
         "Xauth username \(xauthUser)",
     ]
+    // psk authenticates the group with a pre-shared key; cert/hybrid authenticate
+    // the gateway with an X.509 cert (verified against a CA file) instead.
+    if usesCert {
+        guard let ca = ne(p.caFile) else {
+            return .message("\(authmode) auth needs a CA file.\nOpen Manage VPNs and set it.")
+        }
+        lines.append("CA-File \(ca)")
+    } else {
+        guard let secret = keychainSecret(kcService(p, "secret")) else {
+            return .message("Group secret not found in Keychain for “\(p.name)”.\nOpen Manage VPNs and set it.")
+        }
+        lines.append("IPSec secret \(secret)")
+    }
+    let password = keychainSecret(kcService(p, "password"))
     if let xauthDomain { lines.append("Domain \(xauthDomain)") }
     if let password { lines.append("Xauth password \(password)") }
 
@@ -884,6 +910,9 @@ final class RevealableSecureField: NSView {
         get { secure.placeholderString }
         set { secure.placeholderString = newValue; plain.placeholderString = newValue }
     }
+    var isEnabled: Bool = true {
+        didSet { secure.isEnabled = isEnabled; plain.isEnabled = isEnabled; eye.isEnabled = isEnabled }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -942,6 +971,12 @@ final class ProfileEditor: NSObject {
     let vendorPopup = NSPopUpButton()
     let debugPopup = NSPopUpButton()
     let dnsField = NSTextField()
+    let caFileField = NSTextField()
+    let clientCertField = NSTextField()
+    let secretLabel = NSTextField(labelWithString: "Group secret")
+    let caFileLabel = NSTextField(labelWithString: "CA file")
+    let clientCertLabel = NSTextField(labelWithString: "Client cert")
+    let authNote = NSTextField(labelWithString: "")
     let mtuField = NSTextField()
     let dpdField = NSTextField()
     let weakCheck = NSButton(checkboxWithTitle: "Enable weak encryption (3DES)", target: nil, action: nil)
@@ -954,7 +989,7 @@ final class ProfileEditor: NSObject {
     init(profile: Profile?, onSave: @escaping (Profile, String?, String?) -> Void) {
         self.onSave = onSave
         self.existing = profile
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 440),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 410, height: 470),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = profile == nil ? "Add VPN" : "Edit VPN"
         window.isReleasedWhenClosed = false   // we retain it; let ARC free it
@@ -981,6 +1016,14 @@ final class ProfileEditor: NSObject {
         userField.placeholderString = "user  or  DOMAIN\\user"
         dnsField.stringValue = profile?.dnsMatchDomains ?? ""
         dnsField.placeholderString = "example.com, ..."
+        caFileField.stringValue = profile?.caFile ?? ""
+        caFileField.placeholderString = "/path/to/ca.pem"
+        clientCertField.stringValue = profile?.clientCert ?? ""
+        clientCertField.placeholderString = "/path/to/client.pem"
+        authNote.font = .systemFont(ofSize: 11)
+        authNote.textColor = .systemOrange
+        authNote.maximumNumberOfLines = 2
+        authNote.lineBreakMode = .byWordWrapping
         mtuField.stringValue = profile?.mtu ?? ""
         mtuField.placeholderString = "automatic"
         dpdField.stringValue = profile?.dpdTimeout ?? "30"   // seconds
@@ -997,6 +1040,8 @@ final class ProfileEditor: NSObject {
         fill(nattPopup, ["natt", "none", "force-natt", "cisco-udp"], profile?.natMode, "natt")
         fill(vendorPopup, ["cisco", "netscreen", "fortigate"], profile?.vendor, "cisco")
         fill(debugPopup, ["0", "1", "2", "3", "99"], profile?.debug, "0")
+        authmodePopup.target = self
+        authmodePopup.action = #selector(authModeChanged)
 
         weakCheck.state = (profile?.enableWeak ?? true) ? .on : .off    // 3DES on by default
         singleDESCheck.state = (profile?.singleDES ?? false) ? .on : .off
@@ -1021,11 +1066,14 @@ final class ProfileEditor: NSObject {
             [label("Name"), nameField],
             [label("Gateway"), gatewayField],
             [label("Group name"), idField],
-            [label("Group secret"), secretField],
+            [secretLabel, secretField],
             [label("Username"), userField],
             [label("Password"), passwordField],
             [label("VPN domains"), dnsField],
             [label("IKE Authmode"), authmodePopup],
+            [caFileLabel, caFileField],
+            [clientCertLabel, clientCertField],
+            [label(""), authNote],
         ])
         let optionsGrid = grid([
             [label("DH Group"), dhPopup],
@@ -1039,7 +1087,7 @@ final class ProfileEditor: NSObject {
         ])
 
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
-            passwordField, dnsField, mtuField, dpdField,
+            passwordField, dnsField, caFileField, clientCertField, authNote, mtuField, dpdField,
             authmodePopup, dhPopup, pfsPopup, nattPopup, vendorPopup, debugPopup]
         for v in fixedWidth {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -1061,7 +1109,7 @@ final class ProfileEditor: NSObject {
         }
         let tabs = NSTabView()
         tabs.translatesAutoresizingMaskIntoConstraints = false
-        tabs.addTabViewItem(tab(credsGrid, "Creds"))
+        tabs.addTabViewItem(tab(credsGrid, "Credentials"))
         tabs.addTabViewItem(tab(optionsGrid, "Options"))
 
         let save = NSButton(title: "Save", target: self, action: #selector(saveTapped))
@@ -1086,6 +1134,42 @@ final class ProfileEditor: NSObject {
             buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
         ])
+        authModeChanged()   // set initial enabled/grayed state for the auth fields
+    }
+
+    // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid
+    // use the CA file. Whichever isn't relevant is grayed out. If this vpnc has no
+    // TLS backend, cert/hybrid stay selectable but their fields are grayed and a
+    // note explains why.
+    @objc func authModeChanged() {
+        let mode = authmodePopup.titleOfSelectedItem ?? "psk"
+        let usesCert = (mode == "cert" || mode == "hybrid")
+        let certOK = vpncSupportsCerts()
+        // Field-enable matrix by auth mode:
+        //   Group secret -> psk only          (PSK is not used by hybrid/cert)
+        //   CA file      -> hybrid + cert      (verify the gateway's certificate)
+        //   Client cert  -> cert only          (mutual cert auth)
+        //   Username/Password (XAUTH) and Group name stay enabled in all modes.
+        // A disabled NSTextField only dims its text faintly, which is easy to
+        // miss — so also fade the field and its row label to ~35% opacity.
+        func setRow(_ field: NSView, _ rowLabel: NSTextField, _ on: Bool) {
+            let alpha: CGFloat = on ? 1.0 : 0.2
+            field.alphaValue = alpha
+            rowLabel.alphaValue = alpha
+        }
+        secretField.isEnabled = !usesCert
+        caFileField.isEnabled = usesCert
+        clientCertField.isEnabled = (mode == "cert")
+        setRow(secretField, secretLabel, !usesCert)
+        setRow(caFileField, caFileLabel, usesCert)
+        setRow(clientCertField, clientCertLabel, mode == "cert")
+        if usesCert && !certOK {
+            authNote.stringValue = "This VPNC build has no certificate support.\nRebuild with GnuTLS to use \(mode) mode."
+            authNote.isHidden = false
+        } else {
+            authNote.stringValue = ""
+            authNote.isHidden = true
+        }
     }
 
     @objc func saveTapped() {
@@ -1108,7 +1192,8 @@ final class ProfileEditor: NSObject {
             name: name, gateway: gw, id: id, username: user,
             authmode: pv(authmodePopup), dhGroup: pv(dhPopup), pfs: pv(pfsPopup),
             natMode: pv(nattPopup), vendor: pv(vendorPopup), ifmode: nil,
-            domain: nil, dnsMatchDomains: tv(dnsField),
+            domain: nil, dnsMatchDomains: tv(dnsField), caFile: tv(caFileField),
+            clientCert: tv(clientCertField),
             appVersion: existing?.appVersion, localAddr: existing?.localAddr,
             localPort: existing?.localPort, udpPort: existing?.udpPort, mtu: tv(mtuField),
             dpdTimeout: tv(dpdField), debug: pv(debugPopup),
