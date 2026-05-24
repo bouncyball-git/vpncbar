@@ -954,7 +954,7 @@ final class ProfileEditor: NSObject {
     init(profile: Profile?, onSave: @escaping (Profile, String?, String?) -> Void) {
         self.onSave = onSave
         self.existing = profile
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 710),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 440),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = profile == nil ? "Add VPN" : "Edit VPN"
         window.isReleasedWhenClosed = false   // we retain it; let ARC free it
@@ -1009,7 +1009,15 @@ final class ProfileEditor: NSObject {
         encStack.spacing = 4
 
         func label(_ s: String) -> NSTextField { NSTextField(labelWithString: s) }
-        let grid = NSGridView(views: [
+        func grid(_ rows: [[NSView]]) -> NSGridView {
+            let g = NSGridView(views: rows)
+            g.column(at: 0).xPlacement = .trailing
+            g.rowSpacing = 8
+            g.columnSpacing = 10
+            g.translatesAutoresizingMaskIntoConstraints = false
+            return g
+        }
+        let credsGrid = grid([
             [label("Name"), nameField],
             [label("Gateway"), gatewayField],
             [label("Group name"), idField],
@@ -1018,6 +1026,8 @@ final class ProfileEditor: NSObject {
             [label("Password"), passwordField],
             [label("VPN domains"), dnsField],
             [label("IKE Authmode"), authmodePopup],
+        ])
+        let optionsGrid = grid([
             [label("DH Group"), dhPopup],
             [label("PFS"), pfsPopup],
             [label("NAT-T Mode"), nattPopup],
@@ -1027,10 +1037,6 @@ final class ProfileEditor: NSObject {
             [label("Debug level"), debugPopup],
             [label("Encryption"), encStack],
         ])
-        grid.column(at: 0).xPlacement = .trailing
-        grid.rowSpacing = 8
-        grid.columnSpacing = 10
-        grid.translatesAutoresizingMaskIntoConstraints = false
 
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
             passwordField, dnsField, mtuField, dpdField,
@@ -1040,15 +1046,23 @@ final class ProfileEditor: NSObject {
             v.widthAnchor.constraint(equalToConstant: 240).isActive = true
         }
 
-        // Scrollable form (many fields), fixed Save/Cancel below.
-        let doc = FlippedView()
-        doc.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(grid)
-        let scroll = NSScrollView()
-        scroll.documentView = doc
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
+        // Each grid sits top-left inside a tab's view.
+        func tab(_ g: NSGridView, _ title: String) -> NSTabViewItem {
+            let v = NSView()
+            v.addSubview(g)
+            NSLayoutConstraint.activate([
+                g.topAnchor.constraint(equalTo: v.topAnchor, constant: 16),
+                g.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 16),
+            ])
+            let item = NSTabViewItem()
+            item.label = title
+            item.view = v
+            return item
+        }
+        let tabs = NSTabView()
+        tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.addTabViewItem(tab(credsGrid, "Creds"))
+        tabs.addTabViewItem(tab(optionsGrid, "Options"))
 
         let save = NSButton(title: "Save", target: self, action: #selector(saveTapped))
         save.bezelStyle = .rounded
@@ -1061,21 +1075,15 @@ final class ProfileEditor: NSObject {
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
         let content = NSView()
-        content.addSubview(scroll)
+        content.addSubview(tabs)
         content.addSubview(buttons)
         window.contentView = content
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: doc.topAnchor, constant: 16),
-            grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 16),
-            grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -16),
-            grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -16),
-            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-
-            scroll.topAnchor.constraint(equalTo: content.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            buttons.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
-            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            tabs.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            tabs.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            tabs.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            buttons.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 12),
+            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
         ])
     }
