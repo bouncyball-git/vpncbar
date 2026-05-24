@@ -21,7 +21,13 @@ let profilesPath = configDir.appendingPathComponent("profiles.json").path
 // Pidfiles live in a user-creatable, persistent dir (NOT /var/run, which is
 // volatile and root-only). vpnc runs as root but can still write here.
 let pidDir = configDir.appendingPathComponent("run").path
-func pidFile(_ name: String) -> String { "\(pidDir)/\(name).pid" }
+// Pidfile is "<uuid>-<name>.pid": the uuid makes it collision-proof (two profiles
+// can't clash) and ties it to the stable identity; the name is for readability.
+func pidFile(_ p: Profile) -> String {
+    let id = p.uuid ?? p.name
+    let n = p.name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    return "\(pidDir)/\(id)-\(n).pid"
+}
 
 // MARK: - Model
 
@@ -264,11 +270,16 @@ func vpncElapsed(pid: Int) -> Int? {
     return parseEtime(String(etok))
 }
 
-// Connected profile name -> (live pid, elapsed seconds). Detected from running
-// vpnc command lines via `ps` (no root file access needed): we read the live PID
-// and the "--pid-file .../<name>.pid" argument to map each daemon to a profile.
-// Falls back to reading the pidfile for any profile not seen in the process list.
-func connectedTunnels(_ names: [String]) -> [String: (pid: Int, secs: Int)] {
+// Connected profiles -> (live pid, elapsed seconds), keyed by current profile name.
+// Detected from running vpnc command lines via `ps` (no root file access needed):
+// the "--pid-file …/<uuid>-<name>.pid" argument maps each daemon to a profile by
+// its stable uuid (falling back to a legacy "<name>.pid" match). Falls back to
+// reading the pidfile for any profile not seen in the process list.
+func connectedTunnels(_ profiles: [Profile]) -> [String: (pid: Int, secs: Int)] {
+    func match(_ stem: String) -> Profile? {
+        for p in profiles { if let u = p.uuid, stem.hasPrefix(u + "-") { return p } }
+        return profiles.first { $0.name == stem }   // legacy "<name>.pid"
+    }
     var result: [String: (pid: Int, secs: Int)] = [:]
     let r = run(kPs, ["-axo", "pid=,etime=,command="])
     if r.status == 0 {
@@ -276,20 +287,19 @@ func connectedTunnels(_ names: [String]) -> [String: (pid: Int, secs: Int)] {
             let line = raw.trimmingCharacters(in: .whitespaces)
             guard line.contains("/vpnc"), let pf = line.range(of: "--pid-file ") else { continue }
             guard let pathTok = line[pf.upperBound...].split(separator: " ").first else { continue }
-            let base = (String(pathTok) as NSString).lastPathComponent  // "<name>.pid"
+            let base = (String(pathTok) as NSString).lastPathComponent
             guard base.hasSuffix(".pid") else { continue }
-            let name = String(base.dropLast(4))
             let toks = line.split(separator: " ")
-            guard names.contains(name), toks.count >= 2,
+            guard let p = match(String(base.dropLast(4))), toks.count >= 2,
                   let pid = Int(toks[0]), let secs = parseEtime(String(toks[1])) else { continue }
-            result[name] = (pid, secs)
+            result[p.name] = (pid, secs)
         }
     }
-    for name in names where result[name] == nil {
-        if let s = try? String(contentsOfFile: pidFile(name), encoding: .utf8),
+    for p in profiles where result[p.name] == nil {
+        if let s = try? String(contentsOfFile: pidFile(p), encoding: .utf8),
            let pid = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)),
            let secs = vpncElapsed(pid: pid) {
-            result[name] = (pid, secs)
+            result[p.name] = (pid, secs)
         }
     }
     return result
@@ -328,7 +338,7 @@ func resolveGatewayIP(_ host: String) -> String {
 func connect(_ p: Profile) -> ActionResult {
     // Safeguard: never launch a second vpnc for a profile that's already up
     // (a duplicate would fight over the same pidfile and re-resolve the gateway).
-    if !connectedTunnels([p.name]).isEmpty { return .ok }
+    if !connectedTunnels([p]).isEmpty { return .ok }
 
     guard let secret = keychainSecret(kcService(p, "secret")) else {
         return .message("Group secret not found in Keychain for “\(p.name)”.\nOpen Manage VPNs and set it.")
@@ -381,7 +391,7 @@ func connect(_ p: Profile) -> ActionResult {
     let config = lines.joined(separator: "\n") + "\n"
 
     // Each profile gets its own pidfile so multiple tunnels can run at once.
-    let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p.name), "-"], stdin: config)
+    let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p), "-"], stdin: config)
     if r.status == 0 { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once to allow passwordless vpnc.")
@@ -391,8 +401,8 @@ func connect(_ p: Profile) -> ActionResult {
 
 // Disconnect one profile. Prefer the live PID discovered from `ps` (works even
 // if no pidfile was written); fall back to the pidfile path.
-func disconnect(_ name: String) -> ActionResult {
-    let target = connectedTunnels([name])[name].map { "\($0.pid)" } ?? pidFile(name)
+func disconnect(_ p: Profile) -> ActionResult {
+    let target = connectedTunnels([p])[p.name].map { "\($0.pid)" } ?? pidFile(p)
     let r = run(kSudo, ["-n", kVpncDisconnect, target])
     if r.status == 0 || r.out.contains("no vpnc") { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
@@ -499,7 +509,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
 
     func refreshState() {
         let profiles = loadProfiles()
-        let tunnels = connectedTunnels(profiles.map { $0.name })
+        let tunnels = connectedTunnels(profiles)
         let elapsed = tunnels.mapValues { $0.secs }
         let connected = Set(tunnels.keys)
 
@@ -627,9 +637,10 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
 
     // Left-click a profile: toggle just that tunnel — leaves other tunnels alone.
     func toggleProfile(_ name: String) {
-        if !connectedTunnels([name]).isEmpty {
-            perform { disconnect(name) }
-        } else if let p = loadProfiles().first(where: { $0.name == name }) {
+        guard let p = loadProfiles().first(where: { $0.name == name }) else { return }
+        if !connectedTunnels([p]).isEmpty {
+            perform { disconnect(p) }
+        } else {
             perform { connect(p) }
         }
     }
@@ -648,11 +659,13 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     }
 
     @objc func doDisconnectAll() {
-        let names = Array(connectedTunnels(loadProfiles().map { $0.name }).keys)
+        let profiles = loadProfiles()
+        let connected = Set(connectedTunnels(profiles).keys)
+        let toDrop = profiles.filter { connected.contains($0.name) }
         perform {
             var lastError: ActionResult = .ok
-            for n in names {
-                let r = disconnect(n)
+            for p in toDrop {
+                let r = disconnect(p)
                 if case .message = r { lastError = r }
             }
             return lastError
@@ -664,8 +677,10 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     // teardown (restoring its routes/DNS) — graceful even though vpnc outlives us.
     func applicationWillTerminate(_ notification: Notification) {
         tickTimer?.invalidate()
-        for name in connectedTunnels(loadProfiles().map { $0.name }).keys {
-            _ = disconnect(name)
+        let profiles = loadProfiles()
+        let connected = Set(connectedTunnels(profiles).keys)
+        for p in profiles where connected.contains(p.name) {
+            _ = disconnect(p)
         }
     }
 
