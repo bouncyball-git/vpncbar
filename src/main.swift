@@ -13,7 +13,7 @@ let kSudo = "/usr/bin/sudo"
 let kPgrep = "/usr/bin/pgrep"
 let kPs = "/bin/ps"
 let kOtool = "/usr/bin/otool"
-let kNetstat = "/usr/bin/netstat"
+let kNetstat = "/usr/sbin/netstat"
 let kVpncScript = "/opt/local/etc/vpnc/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
 
 // Whether the installed vpnc was built with a TLS backend (GnuTLS/OpenSSL), i.e.
@@ -1085,11 +1085,15 @@ final class RevealableSecureField: NSView {
     }
 }
 
-final class ProfileEditor: NSObject, NSWindowDelegate {
+final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     let window: NSWindow
     let statsTextView = NSTextView()
     let debugTextView = NSTextView()
     private var refreshTimer: Timer?
+    private var tickCount = 0
+    private var loadingDebug = false   // guards against overlapping (slow) log-show fetches
+    private let tabs = NSTabView()
+    private var debugTabItem: NSTabViewItem?
     let nameField = NSTextField()
     let gatewayField = NSTextField()
     let idField = NSTextField()
@@ -1241,12 +1245,14 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
             item.view = v
             return item
         }
-        let tabs = NSTabView()
         tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.delegate = self
         tabs.addTabViewItem(tab(credsGrid, "Credentials"))
         tabs.addTabViewItem(tab(optionsGrid, "Options"))
         tabs.addTabViewItem(statsTab())
-        tabs.addTabViewItem(debugTab())
+        let dbg = debugTab(); debugTabItem = dbg
+        tabs.addTabViewItem(dbg)
+        tabs.addTabViewItem(aboutTab())
 
         let save = NSButton(title: "Save", target: self, action: #selector(saveTapped))
         save.bezelStyle = .rounded
@@ -1272,10 +1278,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
         ])
         authModeChanged()   // set initial enabled/grayed state for the auth fields
 
-        // Info tab refreshes live (cheap); Debug loads once now and on its Refresh
-        // button (the system-log query is slow, so it's not on the timer).
+        // Info tab refreshes live (cheap). Debug only refreshes while its tab is
+        // visible (the system-log query is slow) — loaded on selection + throttled.
         refreshTick()
-        reloadDebug()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshTick() }
         RunLoop.main.add(t, forMode: .common)
         refreshTimer = t
@@ -1347,25 +1352,45 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
         return item
     }
 
-    // Cheap, runs on the 1s timer: just the Info tab.
+    // Runs on the 1s timer: Info every tick (cheap); Debug every 3s (log show is
+    // slow, so it's throttled and fetched off-main — but it does update live now).
     @objc func refreshTick() {
         let stats = buildStatsText()
         if statsTextView.string != stats { statsTextView.string = stats }
+        tickCount += 1
+        // Only poll the (slow) system log while the Debug tab is actually showing.
+        if tickCount % 3 == 0, tabs.selectedTabViewItem === debugTabItem { reloadDebug() }
     }
 
-    // The Debug refresh (Refresh button + initial load). `log show` is slow, so do
-    // it off the main thread and only on demand — not on the 1s timer.
+    // Load the log immediately when the user switches to the Debug tab.
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        if tabViewItem === debugTabItem { reloadDebug() }
+    }
+
+    // Reload the Debug tab off the main thread (so the slow `log show` never freezes
+    // the UI). Skips if a fetch is already in flight; only updates the view when the
+    // text actually changed, and keeps the scroll position unless already at bottom.
     @objc func reloadDebug() {
+        if loadingDebug { return }
+        loadingDebug = true
         if debugTextView.string.isEmpty { debugTextView.string = "Loading vpnc log…" }
         let p = existing
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let text = ProfileEditor.buildDebugText(p)
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.loadingDebug = false
+                guard self.debugTextView.string != text else { return }
+                let atBottom = self.debugAtBottom()
                 self.debugTextView.string = text
-                self.debugTextView.scrollToEndOfDocument(nil)
+                if atBottom { self.debugTextView.scrollToEndOfDocument(nil) }
             }
         }
+    }
+
+    private func debugAtBottom() -> Bool {
+        guard let sv = debugTextView.enclosingScrollView else { return true }
+        return sv.contentView.bounds.maxY >= debugTextView.frame.height - 12
     }
 
     @objc private func clearLog() {
@@ -1377,6 +1402,66 @@ final class ProfileEditor: NSObject, NSWindowDelegate {
     @objc private func revealLog() {
         guard let p = existing else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: logFile(p))])
+    }
+
+    @objc private func openRepo() {
+        if let u = URL(string: "https://github.com/bouncyball-git/vpncbar") { NSWorkspace.shared.open(u) }
+    }
+
+    private func aboutTab() -> NSTabViewItem {
+        func label(_ s: String, _ size: CGFloat, bold: Bool = false,
+                   color: NSColor = .labelColor, width: CGFloat? = nil) -> NSTextField {
+            let f = NSTextField(labelWithString: s)
+            f.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
+            f.textColor = color
+            f.alignment = .center
+            f.maximumNumberOfLines = 0
+            f.lineBreakMode = .byWordWrapping
+            if let w = width {
+                f.preferredMaxLayoutWidth = w
+                f.widthAnchor.constraint(equalToConstant: w).isActive = true
+            }
+            return f
+        }
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
+        let vpncVer = run(kVpnc, ["--version"]).out.split(separator: "\n").first.map(String.init)
+            ?? "vpnc (version unknown)"
+
+        let icon = NSImageView()
+        icon.image = NSApp.applicationIconImage
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let link = NSButton(title: "github.com/bouncyball-git/vpncbar", target: self, action: #selector(openRepo))
+        link.isBordered = false
+        link.contentTintColor = .linkColor
+        link.font = .systemFont(ofSize: 12)
+
+        let stack = NSStackView(views: [
+            icon,
+            label("VpncBar", 22, bold: true),
+            label("Version \(version)", 12, color: .secondaryLabelColor),
+            label("A native macOS menu-bar front-end for the vpnc Cisco IPSec VPN client, using the kernel's native utun interface.", 12, width: 320),
+            label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 320),
+            link,
+            label("Vendored vpnc (streambinder fork + breiter utun port) and vpnc-script (OpenConnect) are GPLv2; see vendor/NOTICE.", 10, color: .tertiaryLabelColor, width: 320),
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let v = NSView()
+        v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: v.topAnchor, constant: 24),
+            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: v.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -16),
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+        ])
+        let item = NSTabViewItem(); item.label = "About"; item.view = v
+        return item
     }
 
     private func buildStatsText() -> String {
