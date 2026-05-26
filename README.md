@@ -10,6 +10,10 @@ It's a small AppKit app (no Xcode project, no dependencies beyond the system
 frameworks) that lives in the status bar and lets you manage profiles, store
 secrets in the Keychain, and bring tunnels up and down with a click.
 
+<p align="center">
+  <img src="docs/VpncBar.png" width="420" alt="VpncBar screenshot">
+</p>
+
 ## Contents
 
 - [Features](#features)
