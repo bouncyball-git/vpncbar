@@ -442,6 +442,12 @@ func connect(_ p: Profile) -> ActionResult {
     lines.append(contentsOf: p.extra ?? [])
     let config = lines.joined(separator: "\n") + "\n"
 
+    // Pre-create the log as OUR user (dropping any prior root-owned one), so vpnc's
+    // fopen("w") truncates it in place and the file stays user-owned — that lets the
+    // Debug tab's Clear truncate it without deleting it out from under a live daemon.
+    try? FileManager.default.removeItem(atPath: logFile(p))
+    FileManager.default.createFile(atPath: logFile(p), contents: nil)
+
     // Each profile gets its own pidfile so multiple tunnels can run at once.
     // --log-file makes vpnc write the whole session (handshake, debug, start/stop)
     // to our per-profile log itself, so the Debug tab just tails that file.
@@ -1322,10 +1328,10 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
 
     private func debugTab() -> NSTabViewItem {
         let sv = makeTextScroll(debugTextView, monospaced: true)
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(reloadDebug))
+        let clear = NSButton(title: "Clear log", target: self, action: #selector(clearLog))
         let reveal = NSButton(title: "Reveal log", target: self, action: #selector(revealLog))
-        for b in [refresh, reveal] { b.bezelStyle = .rounded }
-        let bar = NSStackView(views: [refresh, reveal])
+        for b in [clear, reveal] { b.bezelStyle = .rounded }
+        let bar = NSStackView(views: [clear, reveal])
         bar.spacing = 8
         bar.translatesAutoresizingMaskIntoConstraints = false
         let v = NSView()
@@ -1444,6 +1450,17 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     private func debugAtBottom() -> Bool {
         guard let sv = debugTextView.enclosingScrollView else { return true }
         return sv.contentView.bounds.maxY >= debugTextView.frame.height - 12
+    }
+
+    // Truncate the log in place (non-atomic = same inode), so a live vpnc daemon
+    // keeps writing to it. Falls back to unlink for any legacy root-owned file we
+    // can't truncate (the next connect recreates it user-owned).
+    @objc private func clearLog() {
+        guard let p = existing else { return }
+        let url = URL(fileURLWithPath: logFile(p))
+        do { try Data().write(to: url) }
+        catch { try? FileManager.default.removeItem(atPath: logFile(p)) }
+        reloadDebug()
     }
 
     @objc private func revealLog() {
