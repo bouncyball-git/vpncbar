@@ -619,6 +619,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     var timer: Timer?
     var tickTimer: Timer?     // 1s redraw of elapsed times, only while the menu is open
     var manageWindow: ManageWindow?
+    var signalSources: [DispatchSourceSignal] = []   // SIGTERM/SIGINT → disconnect all, then exit
     private var lastConnected: Set<String>?   // nil until first poll (no notification at launch)
 
     func start() {
@@ -636,6 +637,33 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
         refreshState()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.refreshState()
+        }
+        installTerminationHandlers()
+    }
+
+    // A plain `kill`/`pkill VpncBar` (and our uninstaller) send SIGTERM, which would
+    // otherwise kill us WITHOUT running applicationWillTerminate — orphaning tunnels.
+    // Catch SIGTERM/SIGINT and tear everything down first. (SIGKILL is uncatchable.)
+    func installTerminationHandlers() {
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)   // disable default action; the DispatchSource handles it
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { [weak self] in
+                self?.disconnectAllSync()
+                exit(0)
+            }
+            src.resume()
+            signalSources.append(src)
+        }
+    }
+
+    // Disconnect every live tunnel synchronously (each sends SIGTERM to its vpnc,
+    // which runs the teardown script). Shared by quit and the signal handlers.
+    func disconnectAllSync() {
+        let profiles = loadProfiles()
+        let connected = Set(connectedTunnels(profiles).keys)
+        for p in profiles where connected.contains(p.name) {
+            _ = disconnect(p)
         }
     }
 
@@ -826,11 +854,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     // teardown (restoring its routes/DNS) — graceful even though vpnc outlives us.
     func applicationWillTerminate(_ notification: Notification) {
         tickTimer?.invalidate()
-        let profiles = loadProfiles()
-        let connected = Set(connectedTunnels(profiles).keys)
-        for p in profiles where connected.contains(p.name) {
-            _ = disconnect(p)
-        }
+        disconnectAllSync()
     }
 
     func perform(_ action: @escaping () -> ActionResult) {

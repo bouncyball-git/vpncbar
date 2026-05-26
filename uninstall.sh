@@ -1,26 +1,33 @@
 #!/bin/sh
-# Remove everything install.sh put on the system. Leaves your VPN profiles and
-# Keychain secrets alone (see the note at the end). Run as your normal user.
-set -e
-cd "$(dirname "$0")"
+# Remove VpncBar: disconnect all tunnels, quit the app, then delete the app,
+# /opt/vpncbar, the sudoers rule, and transient runtime files. Works whether
+# installed via ./install.sh or the .pkg. Self-elevates with sudo, so just run:
+#     ./uninstall.sh      (or  /opt/vpncbar/uninstall.sh)
+#
+# Your VPN profiles (~/.config/vpncbar) and Keychain secrets are KEPT — delete
+# those by hand for a full wipe (see the note at the end).
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+cd /
 
-[ "$(id -u)" = 0 ] && { echo "Run as your normal user (NOT sudo)." >&2; exit 1; }
+echo "Quitting VpncBar app…"
+pkill -x VpncBar 2>/dev/null || true
 
-echo "Quitting VpncBar (if running)…"
-osascript -e 'quit app "VpncBar"' 2>/dev/null || true
+# Tear down any live tunnels BEFORE removing files: SIGTERM lets each vpnc run its
+# disconnect script (restoring routes + scoped DNS) — which still exists right now.
+echo "Disconnecting active vpnc tunnels…"
+pkill -TERM -x vpnc 2>/dev/null || true
+for _ in 1 2 3 4 5; do
+    pgrep -x vpnc >/dev/null 2>&1 || break
+    sleep 1
+done
+pkill -KILL -x vpnc 2>/dev/null || true   # force any straggler
 
-echo "Removing /Applications/VpncBar.app…"
+echo "Removing files…"
 rm -rf /Applications/VpncBar.app
-
-echo "Removing /opt/vpncbar and the sudoers rule (sudo)…"
-sudo rm -rf /opt/vpncbar
-sudo rm -f /etc/sudoers.d/vpncbar
-
-echo "Removing transient runtime files…"
-sudo rm -rf /var/run/vpncbar 2>/dev/null || true
+rm -f  /etc/sudoers.d/vpncbar
+rm -rf /var/run/vpncbar
+rm -rf /opt/vpncbar          # last: this script lives here (already loaded, so fine)
 
 echo
-echo "Done. Your profiles and secrets were kept:"
-echo "  profiles : ~/.config/vpncbar/"
-echo "  secrets  : macOS login Keychain (items named vpnc-<uuid>-…)"
-echo "Delete those manually if you want a full wipe."
+echo "Done. Kept your profiles (~/.config/vpncbar) and login-Keychain secrets"
+echo "(items named vpnc-<uuid>-…). Delete those by hand for a full wipe."

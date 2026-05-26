@@ -111,6 +111,7 @@ build_pkg() {
     install -m 755 "$VPNC_DIR/bin/cisco-decrypt"   "$STAGE/opt/vpncbar/cisco-decrypt"
     install -m 755 "$VPNC_DIR/src/vpnc-disconnect" "$STAGE/opt/vpncbar/vpnc-disconnect"
     install -m 755 vendor/vpnc-script              "$STAGE/opt/vpncbar/vpnc-script"
+    install -m 755 uninstall.sh                    "$STAGE/opt/vpncbar/uninstall.sh"
     xattr -cr "$STAGE" 2>/dev/null || true   # no ._ noise in the payload
 
     cat > "$SCRIPTS/postinstall" <<'EOF'
