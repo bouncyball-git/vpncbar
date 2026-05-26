@@ -1507,7 +1507,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             label("A native macOS menu-bar front-end for the vpnc Cisco IPSec VPN client, using the kernel's native utun interface.", 12, width: 320),
             label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 320),
             link,
-            label("Vendored vpnc (streambinder fork + breiter utun port) and vpnc-script (OpenConnect) are GPLv2; see vendor/NOTICE.", 10, color: .tertiaryLabelColor, width: 320),
         ])
         stack.orientation = .vertical
         stack.alignment = .centerX
