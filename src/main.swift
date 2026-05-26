@@ -52,6 +52,12 @@ let infoDir = "/var/run/vpncbar"
 func infoFile(_ p: Profile) -> String { "\(infoDir)/\(p.uuid ?? p.name).info" }
 func logFile(_ p: Profile) -> String { "\(pidDir)/\(p.uuid ?? p.name).log" }
 
+// The exact argv VpncBar launches (Info tab). The profile config — including
+// secrets — is piped to vpnc's stdin (the trailing "-"), so it's not in the argv.
+func vpncCommandLine(_ p: Profile) -> String {
+    "\(kSudo) -n \(kVpnc) --non-inter --pid-file \(pidFile(p)) -"
+}
+
 // MARK: - Model
 
 struct Profile: Codable {
@@ -1093,6 +1099,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     private var tickCount = 0
     private var loadingDebug = false   // guards against overlapping (slow) log-show fetches
     private let tabs = NSTabView()
+    private var infoTabItem: NSTabViewItem?
     private var debugTabItem: NSTabViewItem?
     let nameField = NSTextField()
     let gatewayField = NSTextField()
@@ -1249,7 +1256,8 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         tabs.delegate = self
         tabs.addTabViewItem(tab(credsGrid, "Credentials"))
         tabs.addTabViewItem(tab(optionsGrid, "Options"))
-        tabs.addTabViewItem(statsTab())
+        let info = statsTab(); infoTabItem = info
+        tabs.addTabViewItem(info)
         let dbg = debugTab(); debugTabItem = dbg
         tabs.addTabViewItem(dbg)
         tabs.addTabViewItem(aboutTab())
@@ -1352,19 +1360,23 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         return item
     }
 
-    // Runs on the 1s timer: Info every tick (cheap); Debug every 3s (log show is
-    // slow, so it's throttled and fetched off-main — but it does update live now).
+    // Runs on the 1s timer, but only refreshes a tab while it's actually visible:
+    // Info every tick (cheap), Debug every 3s (log show is slow, off-main).
     @objc func refreshTick() {
-        let stats = buildStatsText()
-        if statsTextView.string != stats { statsTextView.string = stats }
+        if tabs.selectedTabViewItem === infoTabItem { refreshStats() }
         tickCount += 1
-        // Only poll the (slow) system log while the Debug tab is actually showing.
         if tickCount % 3 == 0, tabs.selectedTabViewItem === debugTabItem { reloadDebug() }
     }
 
-    // Load the log immediately when the user switches to the Debug tab.
+    private func refreshStats() {
+        let stats = buildStatsText()
+        if statsTextView.string != stats { statsTextView.string = stats }
+    }
+
+    // Refresh the just-shown tab immediately, so you don't wait for the next tick.
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         if tabViewItem === debugTabItem { reloadDebug() }
+        else if tabViewItem === infoTabItem { refreshStats() }
     }
 
     // Reload the Debug tab off the main thread (so the slow `log show` never freezes
@@ -1473,7 +1485,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         }
         guard let c = connectedTunnels([p])[p.name] else {
             return row("Status:", "Not connected")
-                + "\nConnect this VPN to see its interface, IP, DNS, routes and traffic."
         }
         let t = readTunnelInfo(p)
         var s = row("Status:", "Connected")
@@ -1500,6 +1511,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             s += row("Traffic in:", "\(humanBytes(cnt.rxBytes))  (\(grouped(cnt.rxPkts)) pkts)")
             s += row("Traffic out:", "\(humanBytes(cnt.txBytes))  (\(grouped(cnt.txPkts)) pkts)")
         }
+        s += "\nCommand:\n\(vpncCommandLine(p))\n"
         return s
     }
 
