@@ -1129,6 +1129,11 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     let onSave: (Profile, String?, String?) -> Void
     let existing: Profile?
     var onClose: (() -> Void)?   // registry uses this to drop its entry on close
+    private let toggleButton = NSButton(title: "Connect", target: nil, action: nil)
+    private var toggling = false   // suppress live title updates during a connect/disconnect
+    private var transition: String?   // "Connecting…"/"Disconnecting…" shown in the Status row while in flight
+    private var transitionDeadline = Date.distantPast   // safety timeout for a stuck transition
+    private var cachedBody: String?   // last-known info rows, kept visible through teardown
 
     init(profile: Profile?, onSave: @escaping (Profile, String?, String?) -> Void) {
         self.onSave = onSave
@@ -1268,7 +1273,11 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelTapped))
         cancel.bezelStyle = .rounded
         cancel.keyEquivalent = "\u{1b}"
-        let buttons = NSStackView(views: [cancel, save])
+        toggleButton.bezelStyle = .rounded
+        toggleButton.target = self
+        toggleButton.action = #selector(toggleTapped)
+        updateToggleTitle()   // initial Connect/Disconnect label (disabled for unsaved new profile)
+        let buttons = NSStackView(views: [toggleButton, cancel, save])
         buttons.spacing = 8
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1363,9 +1372,61 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     // Runs on the 1s timer, but only refreshes a tab while it's actually visible:
     // Info every tick (cheap), Debug every 3s (log show is slow, off-main).
     @objc func refreshTick() {
+        advanceTransition()                     // end Connecting…/Disconnecting… when state flips
+        if !toggling { updateToggleTitle() }    // keep the button label in sync with live state
         if tabs.selectedTabViewItem === infoTabItem { refreshStats() }
         tickCount += 1
         if tickCount % 3 == 0, tabs.selectedTabViewItem === debugTabItem { reloadDebug() }
+    }
+
+    // Clear the in-flight transition only once the live state reaches the target
+    // (or a safety timeout) — so Status/button never flicker back through the stale
+    // state while vpnc is still actually coming up or tearing down.
+    private func advanceTransition() {
+        guard let p = existing, let tr = transition else { return }
+        let up = !connectedTunnels([p]).isEmpty
+        let reached = (tr == "Connecting…" && up) || (tr == "Disconnecting…" && !up)
+        if reached || Date() >= transitionDeadline {
+            transition = nil
+            toggling = false
+        }
+    }
+
+    // Connect/Disconnect label reflects live state; disabled for an unsaved new profile.
+    private func updateToggleTitle() {
+        guard let p = existing else {
+            toggleButton.isEnabled = false
+            toggleButton.title = "Connect"
+            return
+        }
+        toggleButton.isEnabled = true
+        toggleButton.title = connectedTunnels([p]).isEmpty ? "Connect" : "Disconnect"
+    }
+
+    @objc private func toggleTapped() {
+        guard let p = existing else { return }
+        let connected = !connectedTunnels([p]).isEmpty
+        toggling = true
+        transition = connected ? "Disconnecting…" : "Connecting…"   // shown in Status row
+        transitionDeadline = Date().addingTimeInterval(20)
+        toggleButton.isEnabled = false   // keep its Connect/Disconnect label, just block re-clicks
+        refreshStats()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = connected ? disconnect(p) : connect(p)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                // On failure, end the transition now and report. On success, leave it:
+                // advanceTransition() ends it once the OS state actually flips, so the
+                // Status/button never snap back through the old state first.
+                if case let .message(msg) = result {
+                    self.transition = nil
+                    self.toggling = false
+                    self.updateToggleTitle()
+                    self.refreshStats()
+                    alert(msg)
+                }
+            }
+        }
     }
 
     private func refreshStats() {
@@ -1483,36 +1544,46 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         func row(_ k: String, _ value: String) -> String {
             k.padding(toLength: 15, withPad: " ", startingAt: 0) + value + "\n"
         }
-        guard let c = connectedTunnels([p])[p.name] else {
-            return row("Status:", "Not connected")
+        // Connecting: there's no tunnel data yet, so just the status.
+        if transition == "Connecting…" { return row("Status:", "Connecting…") }
+
+        // Live tunnel: build the info rows and cache them so they survive teardown.
+        if let c = connectedTunnels([p])[p.name] {
+            let t = readTunnelInfo(p)
+            var body = row("Uptime:", formatElapsed(c.secs))
+            if let v = t.iface { body += row("Interface:", v) }
+            if let iface = t.iface, let cnt = interfaceCounters(iface) {
+                body += row("Traffic in:", "\(humanBytes(cnt.rxBytes))  (\(grouped(cnt.rxPkts)) pkts)")
+                body += row("Traffic out:", "\(humanBytes(cnt.txBytes))  (\(grouped(cnt.txPkts)) pkts)")
+            }
+            body += "\n"   // blank line after Traffic out
+            if let v = t.internalIP { body += row("Internal IP:", v) }
+            if let v = t.gateway { body += row("Gateway:", v) }
+            if let v = t.dns, !v.isEmpty {
+                body += row("DNS:", v.split(separator: " ").joined(separator: ", "))
+            }
+            // Match domains: gateway-supplied + the profile's, de-duplicated, in order.
+            let allDomains = [t.defDomain, t.splitDNS, t.matchDomains]
+                .compactMap { $0 }.joined(separator: " ")
+                .split(separator: " ").map(String.init)
+            var seen = Set<String>(); var domains: [String] = []
+            for d in allDomains where seen.insert(d).inserted { domains.append(d) }
+            if !domains.isEmpty { body += row("Match domains:", domains.joined(separator: ", ")) }
+            if let first = t.routes.first {
+                body += row("Routes:", first)
+                for r in t.routes.dropFirst() { body += row("", r) }
+            }
+            body += "\nCommand (PID \(c.pid)):\n\(vpncCommandLine(p))\n"
+            cachedBody = body
+            return row("Status:", transition ?? "Connected") + body
         }
-        let t = readTunnelInfo(p)
-        var s = row("Status:", "Connected")
-        s += row("Uptime:", formatElapsed(c.secs))
-        s += row("vpnc PID:", "\(c.pid)")
-        if let v = t.iface { s += row("Interface:", v) }
-        if let v = t.internalIP { s += row("Internal IP:", v) }
-        if let v = t.gateway { s += row("Gateway:", v) }
-        if let v = t.dns, !v.isEmpty {
-            s += row("DNS:", v.split(separator: " ").joined(separator: ", "))
+        // Process already gone but disconnect still in flight: keep last-known info.
+        if transition == "Disconnecting…", let body = cachedBody {
+            return row("Status:", "Disconnecting…") + body
         }
-        // Match domains: gateway-supplied + the profile's, de-duplicated, in order.
-        let allDomains = [t.defDomain, t.splitDNS, t.matchDomains]
-            .compactMap { $0 }.joined(separator: " ")
-            .split(separator: " ").map(String.init)
-        var seen = Set<String>(); var domains: [String] = []
-        for d in allDomains where seen.insert(d).inserted { domains.append(d) }
-        if !domains.isEmpty { s += row("Match domains:", domains.joined(separator: ", ")) }
-        if let first = t.routes.first {
-            s += row("Routes:", first)
-            for r in t.routes.dropFirst() { s += row("", r) }
-        }
-        if let iface = t.iface, let cnt = interfaceCounters(iface) {
-            s += row("Traffic in:", "\(humanBytes(cnt.rxBytes))  (\(grouped(cnt.rxPkts)) pkts)")
-            s += row("Traffic out:", "\(humanBytes(cnt.txBytes))  (\(grouped(cnt.txPkts)) pkts)")
-        }
-        s += "\nCommand:\n\(vpncCommandLine(p))\n"
-        return s
+        // Fully disconnected: clear everything.
+        cachedBody = nil
+        return row("Status:", "Not connected")
     }
 
     // Static + off-main-safe (no UI access): runs the slow `log show`. Merges the
