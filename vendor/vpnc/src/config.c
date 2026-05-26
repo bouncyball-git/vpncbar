@@ -930,6 +930,12 @@ void do_config(int argc, char **argv)
 		 * banners/handshake output) so the whole session is captured. */
 		opt_logfile = config[CONFIG_LOG_FILE];
 		if (opt_logfile) {
+			/* Start each session fresh, then point BOTH stdout and stderr at the
+			 * file in append mode — two "w" opens would clobber each other, but
+			 * O_APPEND keeps the two streams interleaved in order. */
+			FILE *trunc = fopen(opt_logfile, "w");
+			if (trunc)
+				fclose(trunc);
 			if (!freopen(opt_logfile, "a", stdout) || !freopen(opt_logfile, "a", stderr)) {
 				/* fall back to normal behaviour if the file can't be opened */
 				opt_logfile = NULL;

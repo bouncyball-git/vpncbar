@@ -50,12 +50,18 @@ func pidFile(_ p: Profile) -> String {
 // It's transient (removed on disconnect), so /var/run is fine. The .log is ours.
 let infoDir = "/var/run/vpncbar"
 func infoFile(_ p: Profile) -> String { "\(infoDir)/\(p.uuid ?? p.name).info" }
-func logFile(_ p: Profile) -> String { "\(pidDir)/\(p.uuid ?? p.name).log" }
+// "<uuid>_<name>.log" — vpnc itself writes the whole session here via --log-file
+// (truncated per connect), so the Debug tab just tails it.
+func logFile(_ p: Profile) -> String {
+    let id = p.uuid ?? p.name
+    let n = p.name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    return "\(pidDir)/\(id)_\(n).log"
+}
 
 // The exact argv VpncBar launches (Info tab). The profile config — including
 // secrets — is piped to vpnc's stdin (the trailing "-"), so it's not in the argv.
 func vpncCommandLine(_ p: Profile) -> String {
-    "\(kSudo) -n \(kVpnc) --non-inter --pid-file \(pidFile(p)) -"
+    "\(kSudo) -n \(kVpnc) --non-inter --pid-file \(pidFile(p)) --log-file \(logFile(p)) -"
 }
 
 // MARK: - Model
@@ -437,15 +443,19 @@ func connect(_ p: Profile) -> ActionResult {
     let config = lines.joined(separator: "\n") + "\n"
 
     // Each profile gets its own pidfile so multiple tunnels can run at once.
-    let r = run(kSudo, ["-n", kVpnc, "--non-inter", "--pid-file", pidFile(p), "-"], stdin: config)
-    appendVpncLog(p, action: "connect", status: r.status, out: r.out, err: r.err,
-                  emptyNote: "(vpnc produced no output — raise Debug level on the Options tab for detail)",
-                  truncate: true)   // fresh log: keep only this (latest) connection
+    // --log-file makes vpnc write the whole session (handshake, debug, start/stop)
+    // to our per-profile log itself, so the Debug tab just tails that file.
+    let r = run(kSudo, ["-n", kVpnc, "--non-inter",
+                        "--pid-file", pidFile(p), "--log-file", logFile(p), "-"], stdin: config)
     if r.status == 0 { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once to allow passwordless vpnc.")
     }
-    return .message("vpnc failed (status \(r.status)):\n\(r.err.isEmpty ? r.out : r.err)")
+    // vpnc's own output went to the log file (not our pipes), so surface its tail.
+    let tail = (try? String(contentsOfFile: logFile(p), encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines).suffix(600)
+    let detail = (tail.map(String.init) ?? "").isEmpty ? (r.err.isEmpty ? r.out : r.err) : String(tail!)
+    return .message("vpnc failed (status \(r.status)):\n\(detail)")
 }
 
 // Disconnect one profile. Prefer the live PID discovered from `ps` (works even
@@ -453,8 +463,7 @@ func connect(_ p: Profile) -> ActionResult {
 func disconnect(_ p: Profile) -> ActionResult {
     let target = connectedTunnels([p])[p.name].map { "\($0.pid)" } ?? pidFile(p)
     let r = run(kSudo, ["-n", kVpncDisconnect, target])
-    appendVpncLog(p, action: "disconnect", status: r.status,
-                  out: "target: \(target)\n" + r.out, err: r.err)
+    // The daemon logs its own teardown to the --log-file, so nothing to append here.
     if r.status == 0 || r.out.contains("no vpnc") { return .ok }
     if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
         return .message("sudo needs a password.\nRun install-sudoers.sh once.")
@@ -526,41 +535,6 @@ func humanBytes(_ n: Int) -> String {
 func grouped(_ n: Int) -> String {
     let f = NumberFormatter(); f.numberStyle = .decimal
     return f.string(from: NSNumber(value: n)) ?? "\(n)"
-}
-
-// Append a vpnc action (connect/disconnect) and its output to the profile's log.
-// vpnc daemonizes after the handshake and then logs to syslog, so this file only
-// holds the foreground stdout we capture (handshake + hex dumps for connect, and
-// vpnc-disconnect's own output) — the Debug tab pairs it with the system log.
-// `truncate: true` (connect) starts a fresh log so only the latest session shows;
-// `false` (disconnect) appends the teardown to that same session.
-func appendVpncLog(_ p: Profile, action: String, status: Int32, out: String, err: String,
-                   emptyNote: String = "(no output)", truncate: Bool = false) {
-    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    var entry = "===== \(action) \(f.string(from: Date())) — exit \(status) =====\n"
-    let body = [out, err].filter { !$0.isEmpty }.joined(separator: "\n")
-    entry += body.isEmpty ? emptyNote + "\n" : (body.hasSuffix("\n") ? body : body + "\n")
-    if truncate {
-        try? entry.write(toFile: logFile(p), atomically: true, encoding: .utf8)
-    } else if let fh = FileHandle(forWritingAtPath: logFile(p)) {
-        fh.seekToEndOfFile(); fh.write(Data(entry.utf8)); fh.closeFile()
-    } else {
-        try? entry.write(toFile: logFile(p), atomically: true, encoding: .utf8)
-    }
-}
-
-// vpnc's runtime narrative (DPD, teardown) and disconnect messages go to the
-// unified system log, not our pipe. Pull them for the Debug tab — scoped to THIS
-// session's PID so old runs don't leak in. `log show` is slow, so call off-main.
-func vpncSyslog(pid: Int?, minutes: Int) -> String {
-    var predicate = "process == \"vpnc\""
-    if let pid = pid { predicate += " && processID == \(pid)" }
-    let r = run("/usr/bin/log", ["show",
-                                 "--predicate", predicate,
-                                 "--last", "\(minutes)m",
-                                 "--info", "--debug", "--style", "compact"])
-    let text = r.status == 0 ? r.out : (r.err.isEmpty ? r.out : r.err)
-    return text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 // MARK: - Profile menu row (left-click connect, right-click edit)
@@ -1096,8 +1070,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     let statsTextView = NSTextView()
     let debugTextView = NSTextView()
     private var refreshTimer: Timer?
-    private var tickCount = 0
-    private var loadingDebug = false   // guards against overlapping (slow) log-show fetches
+    private var debugTimer: Timer?   // fast (~0.25s) tail, runs only while Debug tab is visible
     private let tabs = NSTabView()
     private var infoTabItem: NSTabViewItem?
     private var debugTabItem: NSTabViewItem?
@@ -1306,6 +1279,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     func windowWillClose(_ notification: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        stopDebugPolling()
         onClose?()
     }
 
@@ -1349,10 +1323,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     private func debugTab() -> NSTabViewItem {
         let sv = makeTextScroll(debugTextView, monospaced: true)
         let refresh = NSButton(title: "Refresh", target: self, action: #selector(reloadDebug))
-        let clear = NSButton(title: "Clear log", target: self, action: #selector(clearLog))
         let reveal = NSButton(title: "Reveal log", target: self, action: #selector(revealLog))
-        for b in [refresh, clear, reveal] { b.bezelStyle = .rounded }
-        let bar = NSStackView(views: [refresh, clear, reveal])
+        for b in [refresh, reveal] { b.bezelStyle = .rounded }
+        let bar = NSStackView(views: [refresh, reveal])
         bar.spacing = 8
         bar.translatesAutoresizingMaskIntoConstraints = false
         let v = NSView()
@@ -1369,14 +1342,13 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         return item
     }
 
-    // Runs on the 1s timer, but only refreshes a tab while it's actually visible:
-    // Info every tick (cheap), Debug every 3s (log show is slow, off-main).
+    // Runs on the 1s timer, but only refreshes a tab while it's actually visible
+    // (both reads are cheap now: a `ps` for Info, a file read for Debug).
     @objc func refreshTick() {
         advanceTransition()                     // end Connecting…/Disconnecting… when state flips
         if !toggling { updateToggleTitle() }    // keep the button label in sync with live state
         if tabs.selectedTabViewItem === infoTabItem { refreshStats() }
-        tickCount += 1
-        if tickCount % 3 == 0, tabs.selectedTabViewItem === debugTabItem { reloadDebug() }
+        // Debug has its own fast timer (started when its tab is shown), so it's not here.
     }
 
     // Clear the in-flight transition only once the live state reaches the target
@@ -1436,40 +1408,42 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
 
     // Refresh the just-shown tab immediately, so you don't wait for the next tick.
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
-        if tabViewItem === debugTabItem { reloadDebug() }
-        else if tabViewItem === infoTabItem { refreshStats() }
+        if tabViewItem === debugTabItem {
+            startDebugPolling()
+        } else {
+            stopDebugPolling()
+            if tabViewItem === infoTabItem { refreshStats() }
+        }
     }
 
-    // Reload the Debug tab off the main thread (so the slow `log show` never freezes
-    // the UI). Skips if a fetch is already in flight; only updates the view when the
-    // text actually changed, and keeps the scroll position unless already at bottom.
+    // Near-real-time tail while the Debug tab is visible; cheap (local file read).
+    private func startDebugPolling() {
+        stopDebugPolling()
+        reloadDebug()
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.reloadDebug() }
+        RunLoop.main.add(t, forMode: .common)
+        debugTimer = t
+    }
+
+    private func stopDebugPolling() {
+        debugTimer?.invalidate()
+        debugTimer = nil
+    }
+
+    // Tail the per-profile vpnc log file. Cheap (a file read), so it can run every
+    // tick; only updates the view when the text changed, keeping the scroll position
+    // unless already at the bottom (then auto-scrolls like tail -f).
     @objc func reloadDebug() {
-        if loadingDebug { return }
-        loadingDebug = true
-        if debugTextView.string.isEmpty { debugTextView.string = "Loading vpnc log…" }
-        let p = existing
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let text = ProfileEditor.buildDebugText(p)
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.loadingDebug = false
-                guard self.debugTextView.string != text else { return }
-                let atBottom = self.debugAtBottom()
-                self.debugTextView.string = text
-                if atBottom { self.debugTextView.scrollToEndOfDocument(nil) }
-            }
-        }
+        let text = ProfileEditor.buildDebugText(existing)
+        guard debugTextView.string != text else { return }
+        let atBottom = debugAtBottom()
+        debugTextView.string = text
+        if atBottom { debugTextView.scrollToEndOfDocument(nil) }
     }
 
     private func debugAtBottom() -> Bool {
         guard let sv = debugTextView.enclosingScrollView else { return true }
         return sv.contentView.bounds.maxY >= debugTextView.frame.height - 12
-    }
-
-    @objc private func clearLog() {
-        guard let p = existing else { return }
-        try? Data().write(to: URL(fileURLWithPath: logFile(p)))   // only the part we own
-        reloadDebug()
     }
 
     @objc private func revealLog() {
@@ -1586,73 +1560,20 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         return row("Status:", "Not connected")
     }
 
-    // Static + off-main-safe (no UI access): runs the slow `log show`. Merges the
-    // system log (disconnect/runtime, all tunnels) with our captured connect/
-    // disconnect stdout (handshake + routes, this profile) into one time-ordered view.
+    // vpnc writes the whole session (handshake, debug, start/stop) to logFile(p) via
+    // --log-file, truncated per connect — so the Debug tab just tails that file.
     static func buildDebugText(_ p: Profile?) -> String {
         guard let p = p else { return "Save this profile first, then connect to see logs." }
-
-        func fmt(_ pattern: String) -> DateFormatter {
-            let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
-            f.dateFormat = pattern; return f
-        }
-        let sysFmt = fmt("yyyy-MM-dd HH:mm:ss.SSS")
-        let capFmt = fmt("yyyy-MM-dd HH:mm:ss")
-
-        // The captured log already holds only the latest session (overwritten on
-        // connect). Read it first so we can find this session's PID for syslog scope.
-        let captured = (try? String(contentsOfFile: logFile(p), encoding: .utf8)) ?? ""
-
-        // Session PID: the live tunnel's PID if connected, else the last PID we
-        // logged on disconnect ("target: <pid>"). Used to scope the system log to
-        // just this connection — no old runs.
-        let live = connectedTunnels([p])[p.name]
-        var pid: Int? = live?.pid
-        if pid == nil {
-            for line in captured.split(separator: "\n") where line.contains("target:") {
-                if let r = line.range(of: #"\d+"#, options: .regularExpression) { pid = Int(line[r]) }
-            }
-        }
-        // Window: cover this connection's whole uptime (+buffer); short if idle.
-        let minutes = (live.map { $0.secs / 60 } ?? 15) + 10
-
-        var events: [(when: Date, text: String)] = []
-
-        // System log for this session's PID only.
-        if pid != nil {
-            for line in vpncSyslog(pid: pid, minutes: minutes).split(separator: "\n") {
-                let s = String(line)
-                guard s.count >= 23, let d = sysFmt.date(from: String(s.prefix(23))) else { continue }
-                events.append((d, s))
-            }
-        }
-
-        // Captured stdout: each "===== action TIME — exit N =====" block is one
-        // event, timestamped by its header so it interleaves with the syslog lines.
-        var headerDate: Date?
-        var buf: [String] = []
-        func flush() { if let d = headerDate { events.append((d, buf.joined(separator: "\n"))) } }
-        for line in captured.split(separator: "\n", omittingEmptySubsequences: false) {
-            let s = String(line)
-            if s.hasPrefix("===== "),
-               let r = s.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression),
-               let d = capFmt.date(from: String(s[r])) {
-                flush(); headerDate = d; buf = [s]
-            } else {
-                buf.append(s)
-            }
-        }
-        flush()
-
-        guard !events.isEmpty else {
+        guard let raw = try? String(contentsOfFile: logFile(p), encoding: .utf8),
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return "No connection logged for “\(p.name)” yet."
         }
-        events.sort { $0.when < $1.when }
-        let state = live != nil ? "connected, PID \(pid.map(String.init) ?? "?")" : "last session"
-        var out = "═══ vpnc — \(p.name) (\(state)), time-ordered ═══\n"
-        out += "(latest connection only; system-log lines scoped to this session's PID)\n\n"
-        out += events.map(\.text).joined(separator: "\n")
-        return out
+        // Cap very large (level-99) logs to the most recent ~256 KB.
+        let maxBytes = 262_144
+        if raw.utf8.count > maxBytes {
+            return "…(earlier output truncated)…\n" + String(raw.suffix(maxBytes))
+        }
+        return raw
     }
 
     // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid
