@@ -1,5 +1,7 @@
 # Build output
 /bin/
+/build/
+/dist/
 vendor/vpnc/bin/
 vendor/deps/
 *.o

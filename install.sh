@@ -17,8 +17,8 @@ APP="bin/VpncBar.app"
 [ "$(id -u)" = 0 ] && { echo "Run as your normal user (NOT sudo); it will sudo the steps that need root." >&2; exit 1; }
 
 # 1. Build the self-contained vpnc + the app if they're not already built.
-[ -f vendor/vpnc/bin/vpnc ] && [ -f vendor/vpnc/bin/cisco-decrypt ] || ./build-vpnc.sh
-[ -d "$APP" ] || ./build.sh
+[ -f vendor/vpnc/bin/vpnc ] && [ -f vendor/vpnc/bin/cisco-decrypt ] || ./build.sh vpnc
+[ -d "$APP" ] || ./build.sh app
 
 # 2. App -> /Applications
 echo "Installing VpncBar.app -> /Applications…"

@@ -193,7 +193,11 @@ OpenSSL alternative and its licensing caveat.
 ## Cleaning up
 
 ```sh
-./clean-all.sh     # remove app build + vendored vpnc objects/binaries (sources kept)
+./clean.sh         # remove all build artifacts (sources kept)
+./clean.sh app     # just the VpncBar.app build (bin/)
+./clean.sh vpnc    # just the vendored vpnc objects/binaries
+./clean.sh deps    # just the static crypto libs (vendor/deps)
+./clean.sh pkg     # just the installer artifacts (build/ + dist/)
 ```
 
 ## Licensing
