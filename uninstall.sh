@@ -11,6 +11,9 @@ cd /
 
 echo "Quitting VpncBar app…"
 pkill -x VpncBar 2>/dev/null || true
+# Wait for it to actually exit — you can't reliably delete a running .app bundle.
+for _ in 1 2 3 4 5 6; do pgrep -x VpncBar >/dev/null 2>&1 || break; sleep 0.5; done
+pkill -KILL -x VpncBar 2>/dev/null || true
 
 # Tear down any live tunnels BEFORE removing files: SIGTERM lets each vpnc run its
 # disconnect script (restoring routes + scoped DNS) — which still exists right now.

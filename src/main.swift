@@ -1496,6 +1496,40 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         if let u = URL(string: "https://github.com/bouncyball-git/vpncbar") { NSWorkspace.shared.open(u) }
     }
 
+    @objc private func uninstallTapped() {
+        let uninstaller = "/opt/vpncbar/uninstall.sh"
+        guard FileManager.default.isExecutableFile(atPath: uninstaller) else {
+            alert("VpncBar doesn't look installed — \(uninstaller) is missing.\nRun ./uninstall.sh from the source tree instead.")
+            return
+        }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Uninstall VpncBar?"
+        a.informativeText = "This disconnects all tunnels and removes the app, /opt/vpncbar, and the sudoers rule. Your saved profiles and Keychain secrets are kept."
+        a.addButton(withTitle: "Uninstall")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        // Spawn a DETACHED root helper (macOS auth prompt) that first waits for this
+        // app to fully quit, THEN runs the uninstaller — so the .app isn't running
+        // when it's removed (you can't reliably delete a live app bundle). We then
+        // quit the app, which lets the helper proceed.
+        let helper = "(while /usr/bin/pgrep -x VpncBar >/dev/null 2>&1; do sleep 0.3; done; "
+                   + "\(uninstaller)) </dev/null >/tmp/vpncbar-uninstall.log 2>&1 &"
+        let cmd = "do shell script \"\(helper)\" with administrator privileges"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", cmd]
+        p.terminationHandler = { proc in
+            // Only quit (→ let the helper run) if the user actually authenticated.
+            if proc.terminationStatus == 0 {
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+        }
+        do { try p.run() } catch { alert("Couldn't start the uninstaller: \(error.localizedDescription)") }
+    }
+
     private func aboutTab() -> NSTabViewItem {
         func label(_ s: String, _ size: CGFloat, bold: Bool = false,
                    color: NSColor = .labelColor, width: CGFloat? = nil) -> NSTextField {
@@ -1524,6 +1558,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         link.contentTintColor = .linkColor
         link.font = .systemFont(ofSize: 12)
 
+        let uninstall = NSButton(title: "Uninstall VpncBar…", target: self, action: #selector(uninstallTapped))
+        uninstall.bezelStyle = .rounded
+
         let stack = NSStackView(views: [
             icon,
             label("VpncBar", 22, bold: true),
@@ -1531,6 +1568,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             label("A native macOS menu-bar front-end for the vpnc Cisco IPSec VPN client, using the kernel's native utun interface.", 12, width: 320),
             label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 320),
             link,
+            uninstall,
         ])
         stack.orientation = .vertical
         stack.alignment = .centerX

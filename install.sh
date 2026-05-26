@@ -32,6 +32,7 @@ sudo install -m 755 vendor/vpnc/bin/vpnc            "$PKG/vpnc"
 sudo install -m 755 vendor/vpnc/bin/cisco-decrypt   "$PKG/cisco-decrypt"
 sudo install -m 755 vendor/vpnc/src/vpnc-disconnect "$PKG/vpnc-disconnect"
 sudo install -m 755 vendor/vpnc-script              "$PKG/vpnc-script"
+sudo install -m 755 uninstall.sh                    "$PKG/uninstall.sh"
 
 # 4. sudoers: let this user run vpnc/vpnc-disconnect as root without a password.
 DEST="/etc/sudoers.d/vpncbar"
