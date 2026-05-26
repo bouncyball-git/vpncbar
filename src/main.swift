@@ -1645,7 +1645,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         flush()
 
         guard !events.isEmpty else {
-            return "No connection logged for “\(p.name)” yet.\n\nConnect this VPN, then press Refresh."
+            return "No connection logged for “\(p.name)” yet."
         }
         events.sort { $0.when < $1.when }
         let state = live != nil ? "connected, PID \(pid.map(String.init) ?? "?")" : "last session"

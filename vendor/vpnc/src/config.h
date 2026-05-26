@@ -61,6 +61,7 @@ enum config_enum {
 	CONFIG_CA_FILE,
 	CONFIG_CA_DIR,
 	CONFIG_PASSWORD_HELPER,
+	CONFIG_LOG_FILE,
 	LAST_CONFIG
 };
 
@@ -101,6 +102,7 @@ extern const char *config[LAST_CONFIG];
 extern enum vendor_enum opt_vendor;
 extern int opt_debug;
 extern int opt_nd;
+extern const char *opt_logfile;   /* --log-file: all output goes here (VpncBar) */
 extern int opt_weak_encryption, opt_no_encryption, opt_weak_authentication, opt_auth_mode;
 extern enum natt_mode_enum opt_natt_mode;
 extern enum if_mode_enum opt_if_mode;

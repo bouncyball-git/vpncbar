@@ -36,6 +36,7 @@ const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:?()/%@!$";
 
 int opt_debug = 0;
 int opt_nd;
+const char *opt_logfile = NULL;   /* --log-file: redirect all output to this file (VpncBar) */
 int opt_weak_encryption, opt_no_encryption, opt_weak_authentication, opt_auth_mode;
 enum natt_mode_enum opt_natt_mode;
 enum vendor_enum opt_vendor;
@@ -66,15 +67,30 @@ extern void logmsg(int priority, const char *format, ...)
 	}
 
 	va_list ap;
-	va_start(ap, format);
-	if (!opt_nd) {
+	if (opt_logfile) {
+		/* VpncBar: status/start/stop/errors go to BOTH the log file
+		 * (stderr is redirected to it) and syslog. (Debug output reaches
+		 * the file via stdout, but never syslog.) */
+		va_start(ap, format);
 		vsyslog(priority, format, ap);
-	} else {
+		va_end(ap);
+		va_start(ap, format);
 		fprintf(stderr, "vpnc: ");
 		vfprintf(stderr, format, ap);
 		fprintf(stderr, "\n");
+		va_end(ap);
+		fflush(stderr);
+	} else if (!opt_nd) {
+		va_start(ap, format);
+		vsyslog(priority, format, ap);
+		va_end(ap);
+	} else {
+		va_start(ap, format);
+		fprintf(stderr, "vpnc: ");
+		vfprintf(stderr, format, ap);
+		fprintf(stderr, "\n");
+		va_end(ap);
 	}
-	va_end(ap);
 }
 
 void hex_dump(const char *str, const void *data, ssize_t len, const struct debug_strings *decode)
@@ -576,6 +592,12 @@ static const struct config_names_s {
      "<filename>",
      "store the pid of background process in <filename>",
      config_def_pid_file},
+    {CONFIG_LOG_FILE, 1, 0, 1,
+     "--log-file",
+     "LogFile",
+     "<filename>",
+     "redirect all output (incl. debug) to <filename>; nothing on stdout/stderr; status also to syslog",
+     NULL},
     {CONFIG_LOCAL_ADDR, 1, 0, 1,
      "--local-addr",
      "Local Addr",
@@ -902,6 +924,20 @@ void do_config(int argc, char **argv)
 
 		opt_debug = (config[CONFIG_DEBUG]) ? atoi(config[CONFIG_DEBUG]) : 0;
 		opt_nd = (config[CONFIG_ND]) ? 1 : 0;
+
+		/* VpncBar: --log-file redirects ALL console output to the file, so
+		 * nothing reaches the real stdout/stderr. Done early (before any
+		 * banners/handshake output) so the whole session is captured. */
+		opt_logfile = config[CONFIG_LOG_FILE];
+		if (opt_logfile) {
+			if (!freopen(opt_logfile, "a", stdout) || !freopen(opt_logfile, "a", stderr)) {
+				/* fall back to normal behaviour if the file can't be opened */
+				opt_logfile = NULL;
+			} else {
+				setvbuf(stdout, NULL, _IOLBF, 0);   /* line-buffered: appears promptly */
+				setvbuf(stderr, NULL, _IONBF, 0);
+			}
+		}
 		opt_weak_encryption = (config[CONFIG_ENABLE_WEAK_ENCRYPTION]) ? 1 : 0;
 		opt_weak_authentication = (config[CONFIG_ENABLE_WEAK_AUTHENTICATION]) ? 1 : 0;
 

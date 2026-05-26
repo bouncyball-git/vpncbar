@@ -44,6 +44,16 @@ native "utun" interface instead of the unavailable tuntaposx kext):
 
   src/config.c
     - Version banner reports "0.5.3 (utun)".
+    - Added a --log-file <path> option (conf directive "LogFile"). When set, all
+      console output is redirected to that file (freopen of stdout+stderr), so
+      nothing goes to the terminal; logmsg() status/start/stop/error lines are
+      written to BOTH the file and syslog, while debug/hex output goes to the file
+      only. Lets VpncBar capture a tunnel's full log even though vpnc daemonizes.
+
+  src/tunip.c
+    - When --log-file is in effect, the daemonizing fork keeps stdout/stderr on the
+      log file instead of redirecting them to /dev/null, and openlog() omits
+      LOG_PERROR (so syslog lines aren't duplicated into the file).
 
   Makefile
     - Dropped GCC-only -freorder-blocks / -fsched-interblock (Apple clang rejects

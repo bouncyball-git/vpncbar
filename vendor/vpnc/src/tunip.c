@@ -1170,10 +1170,15 @@ void vpnc_doit(struct sa_block *s)
 		} else if (pid == 0) {
 			close(0);
 			open("/dev/null", O_RDONLY, 0666);
-			close(1);
-			open("/dev/null", O_WRONLY, 0666);
-			close(2);
-			open("/dev/null", O_WRONLY, 0666);
+			/* VpncBar: with --log-file, stdout/stderr are already redirected
+			 * to the log file — keep them so the daemon's output is captured
+			 * instead of going to /dev/null. */
+			if (!opt_logfile) {
+				close(1);
+				open("/dev/null", O_WRONLY, 0666);
+				close(2);
+				open("/dev/null", O_WRONLY, 0666);
+			}
 			setsid();
 		} else {
 			printf("VPNC started in background (pid: %d)...\n", (int)pid);
@@ -1184,7 +1189,9 @@ void vpnc_doit(struct sa_block *s)
 			 */
 			_exit(0);
 		}
-		openlog("vpnc", LOG_PID | LOG_PERROR, LOG_DAEMON);
+		/* VpncBar: with --log-file, logmsg() writes to the file itself, so
+		 * don't let LOG_PERROR duplicate every syslog line into it too. */
+		openlog("vpnc", LOG_PID | (opt_logfile ? 0 : LOG_PERROR), LOG_DAEMON);
 	} else {
 		printf("VPNC started in foreground...\n");
 	}
