@@ -126,7 +126,12 @@ EOF
     chmod 755 "$SCRIPTS/postinstall"
 
     echo "[pkg] building component + product…"
-    pkgbuild --root "$STAGE" --identifier "$ID" --version "$VER" \
+    # Force BundleIsRelocatable=false so the .app always installs to /Applications
+    # instead of being relocated onto some other copy the installer finds via Spotlight.
+    CPLIST="build/component.plist"
+    pkgbuild --analyze --root "$STAGE" "$CPLIST" >/dev/null
+    /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$CPLIST" 2>/dev/null || true
+    pkgbuild --root "$STAGE" --component-plist "$CPLIST" --identifier "$ID" --version "$VER" \
              --scripts "$SCRIPTS" --ownership recommended --install-location / "$COMP"
 
     cat > "$DISTXML" <<EOF

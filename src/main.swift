@@ -619,6 +619,7 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     var timer: Timer?
     var tickTimer: Timer?     // 1s redraw of elapsed times, only while the menu is open
     var manageWindow: ManageWindow?
+    var aboutWindow: AboutWindow?
     var signalSources: [DispatchSourceSignal] = []   // SIGTERM/SIGINT → disconnect all, then exit
     private var lastConnected: Set<String>?   // nil until first poll (no notification at launch)
 
@@ -787,9 +788,9 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
         let m = NSMenuItem(title: "Manage VPNs…", action: #selector(openManage), keyEquivalent: "")
         m.target = self
         menu.addItem(m)
-        let imp = NSMenuItem(title: "Import Config…", action: #selector(importConfig), keyEquivalent: "")
-        imp.target = self
-        menu.addItem(imp)
+        let about = NSMenuItem(title: "About VpncBar", action: #selector(openAbout), keyEquivalent: "")
+        about.target = self
+        menu.addItem(about)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit VpncBar",
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -876,24 +877,10 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
         manageWindow?.show()
     }
 
-    @objc func importConfig() {
-        let panel = NSOpenPanel()
-        panel.title = "Import VPN config"
-        panel.allowsOtherFileTypes = true
-        panel.allowedContentTypes = ["pcf", "conf", "txt"].compactMap { UTType(filenameExtension: $0) }
+    @objc func openAbout() {
+        if aboutWindow == nil { aboutWindow = AboutWindow() }
         NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard let parsed = parseConfigFile(url.path) else {
-            alert("Couldn't parse that file as a Cisco .pcf or vpnc .conf.")
-            return
-        }
-        upsert(parsed.profile, secret: parsed.secret, password: parsed.password)
-        var notes: [String] = []
-        if parsed.secret == nil { notes.append("group secret") }
-        if parsed.password == nil { notes.append("password") }
-        let missing = notes.isEmpty ? "" : "\n\nMissing (set them in Manage VPNs): \(notes.joined(separator: ", "))."
-        alert("Imported “\(parsed.profile.name)”.\(missing)")
-        refreshState()
+        aboutWindow?.show()
     }
 }
 
@@ -1026,6 +1013,115 @@ final class ManageWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         reload()
     }
 
+}
+
+// MARK: - About window (app info + Uninstall)
+
+final class AboutWindow: NSObject {
+    let window: NSWindow
+
+    override init() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
+                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "About VpncBar"
+        window.isReleasedWhenClosed = false
+        super.init()
+
+        func label(_ s: String, _ size: CGFloat, bold: Bool = false,
+                   color: NSColor = .labelColor, width: CGFloat? = nil) -> NSTextField {
+            let f = NSTextField(labelWithString: s)
+            f.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
+            f.textColor = color
+            f.alignment = .center
+            f.maximumNumberOfLines = 0
+            f.lineBreakMode = .byWordWrapping
+            if let w = width {
+                f.preferredMaxLayoutWidth = w
+                f.widthAnchor.constraint(equalToConstant: w).isActive = true
+            }
+            return f
+        }
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
+        let vpncVer = run(kVpnc, ["--version"]).out.split(separator: "\n").first.map(String.init)
+            ?? "vpnc (version unknown)"
+
+        let icon = NSImageView()
+        icon.image = NSApp.applicationIconImage
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let link = NSButton(title: "github.com/bouncyball-git/vpncbar", target: self, action: #selector(openRepo))
+        link.isBordered = false
+        link.contentTintColor = .linkColor
+        link.font = .systemFont(ofSize: 12)
+
+        let uninstall = NSButton(title: "Uninstall VpncBar…", target: self, action: #selector(uninstallTapped))
+        uninstall.bezelStyle = .rounded
+
+        let stack = NSStackView(views: [
+            icon,
+            label("VpncBar", 22, bold: true),
+            label("Version \(version)", 12, color: .secondaryLabelColor),
+            label("A native macOS menu-bar front-end for the vpnc Cisco IPSec VPN client, using the kernel's native utun interface.", 12, width: 300),
+            label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 300),
+            link,
+            uninstall,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(stack)
+        window.contentView = content
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+            stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: content.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -16),
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+        ])
+        window.center()
+    }
+
+    func show() { window.makeKeyAndOrderFront(nil) }
+
+    @objc private func openRepo() {
+        if let u = URL(string: "https://github.com/bouncyball-git/vpncbar") { NSWorkspace.shared.open(u) }
+    }
+
+    @objc private func uninstallTapped() {
+        let uninstaller = "/opt/vpncbar/uninstall.sh"
+        guard FileManager.default.isExecutableFile(atPath: uninstaller) else {
+            alert("VpncBar doesn't look installed — \(uninstaller) is missing.\nRun ./uninstall.sh from the source tree instead.")
+            return
+        }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Uninstall VpncBar?"
+        a.informativeText = "This disconnects all tunnels and removes VpncBar.app (from /Applications), /opt/vpncbar, and the sudoers rule. Your saved profiles and Keychain secrets are kept."
+        a.addButton(withTitle: "Uninstall")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        // Spawn a DETACHED root helper (macOS auth prompt) that first waits for this
+        // app to fully quit, THEN runs the uninstaller — so the .app isn't running
+        // when it's removed. We then quit the app, which lets the helper proceed.
+        let helper = "(while /usr/bin/pgrep -x VpncBar >/dev/null 2>&1; do sleep 0.3; done; "
+                   + "\(uninstaller)) </dev/null >/tmp/vpncbar-uninstall.log 2>&1 &"
+        let cmd = "do shell script \"\(helper)\" with administrator privileges"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", cmd]
+        p.terminationHandler = { proc in
+            if proc.terminationStatus == 0 {   // only quit if the user authenticated
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+        }
+        do { try p.run() } catch { alert("Couldn't start the uninstaller: \(error.localizedDescription)") }
+    }
 }
 
 // MARK: - Profile editor sheet
@@ -1268,7 +1364,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         tabs.addTabViewItem(info)
         let dbg = debugTab(); debugTabItem = dbg
         tabs.addTabViewItem(dbg)
-        tabs.addTabViewItem(aboutTab())
 
         let save = NSButton(title: "Save", target: self, action: #selector(saveTapped))
         save.bezelStyle = .rounded
@@ -1492,102 +1587,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: logFile(p))])
     }
 
-    @objc private func openRepo() {
-        if let u = URL(string: "https://github.com/bouncyball-git/vpncbar") { NSWorkspace.shared.open(u) }
-    }
-
-    @objc private func uninstallTapped() {
-        let uninstaller = "/opt/vpncbar/uninstall.sh"
-        guard FileManager.default.isExecutableFile(atPath: uninstaller) else {
-            alert("VpncBar doesn't look installed — \(uninstaller) is missing.\nRun ./uninstall.sh from the source tree instead.")
-            return
-        }
-        let a = NSAlert()
-        a.alertStyle = .warning
-        a.messageText = "Uninstall VpncBar?"
-        a.informativeText = "This disconnects all tunnels and removes the app, /opt/vpncbar, and the sudoers rule. Your saved profiles and Keychain secrets are kept."
-        a.addButton(withTitle: "Uninstall")
-        a.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertFirstButtonReturn else { return }
-
-        // Spawn a DETACHED root helper (macOS auth prompt) that first waits for this
-        // app to fully quit, THEN runs the uninstaller — so the .app isn't running
-        // when it's removed (you can't reliably delete a live app bundle). We then
-        // quit the app, which lets the helper proceed.
-        let helper = "(while /usr/bin/pgrep -x VpncBar >/dev/null 2>&1; do sleep 0.3; done; "
-                   + "\(uninstaller)) </dev/null >/tmp/vpncbar-uninstall.log 2>&1 &"
-        let cmd = "do shell script \"\(helper)\" with administrator privileges"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", cmd]
-        p.terminationHandler = { proc in
-            // Only quit (→ let the helper run) if the user actually authenticated.
-            if proc.terminationStatus == 0 {
-                DispatchQueue.main.async { NSApp.terminate(nil) }
-            }
-        }
-        do { try p.run() } catch { alert("Couldn't start the uninstaller: \(error.localizedDescription)") }
-    }
-
-    private func aboutTab() -> NSTabViewItem {
-        func label(_ s: String, _ size: CGFloat, bold: Bool = false,
-                   color: NSColor = .labelColor, width: CGFloat? = nil) -> NSTextField {
-            let f = NSTextField(labelWithString: s)
-            f.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
-            f.textColor = color
-            f.alignment = .center
-            f.maximumNumberOfLines = 0
-            f.lineBreakMode = .byWordWrapping
-            if let w = width {
-                f.preferredMaxLayoutWidth = w
-                f.widthAnchor.constraint(equalToConstant: w).isActive = true
-            }
-            return f
-        }
-        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
-        let vpncVer = run(kVpnc, ["--version"]).out.split(separator: "\n").first.map(String.init)
-            ?? "vpnc (version unknown)"
-
-        let icon = NSImageView()
-        icon.image = NSApp.applicationIconImage
-        icon.translatesAutoresizingMaskIntoConstraints = false
-
-        let link = NSButton(title: "github.com/bouncyball-git/vpncbar", target: self, action: #selector(openRepo))
-        link.isBordered = false
-        link.contentTintColor = .linkColor
-        link.font = .systemFont(ofSize: 12)
-
-        let uninstall = NSButton(title: "Uninstall VpncBar…", target: self, action: #selector(uninstallTapped))
-        uninstall.bezelStyle = .rounded
-
-        let stack = NSStackView(views: [
-            icon,
-            label("VpncBar", 22, bold: true),
-            label("Version \(version)", 12, color: .secondaryLabelColor),
-            label("A native macOS menu-bar front-end for the vpnc Cisco IPSec VPN client, using the kernel's native utun interface.", 12, width: 320),
-            label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 320),
-            link,
-            uninstall,
-        ])
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        let v = NSView()
-        v.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: v.topAnchor, constant: 24),
-            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
-            stack.leadingAnchor.constraint(greaterThanOrEqualTo: v.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -16),
-            icon.widthAnchor.constraint(equalToConstant: 64),
-            icon.heightAnchor.constraint(equalToConstant: 64),
-        ])
-        let item = NSTabViewItem(); item.label = "About"; item.view = v
-        return item
-    }
 
     private func buildStatsText() -> String {
         guard let p = existing else {
