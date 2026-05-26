@@ -1,6 +1,7 @@
 # Build output
 /bin/
 vendor/vpnc/bin/
+vendor/deps/
 *.o
 *.log
 .DS_Store

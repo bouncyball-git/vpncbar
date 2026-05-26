@@ -5,16 +5,16 @@ import UserNotifications
 
 // MARK: - Paths
 
-let kVpnc = "/opt/local/sbin/vpnc"
-let kVpncDisconnect = "/opt/local/sbin/vpnc-disconnect"
-let kCiscoDecrypt = "/opt/local/bin/cisco-decrypt"
+let kVpnc = "/opt/vpncbar/vpnc"
+let kVpncDisconnect = "/opt/vpncbar/vpnc-disconnect"
+let kCiscoDecrypt = "/opt/vpncbar/cisco-decrypt"
 let kSecurity = "/usr/bin/security"
 let kSudo = "/usr/bin/sudo"
 let kPgrep = "/usr/bin/pgrep"
 let kPs = "/bin/ps"
 let kOtool = "/usr/bin/otool"
 let kNetstat = "/usr/sbin/netstat"
-let kVpncScript = "/opt/local/etc/vpnc/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
+let kVpncScript = "/opt/vpncbar/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
 
 // Whether the installed vpnc was built with a TLS backend (GnuTLS/OpenSSL), i.e.
 // supports IKE Authmode cert/hybrid. Detected from its linked libraries; cached.

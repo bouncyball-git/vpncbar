@@ -60,7 +60,11 @@ native "utun" interface instead of the unavailable tuntaposx kext):
       them); silenced the pkg-config probe (falls back to libgcrypt-config);
       added -Wno-unused-* to quiet benign upstream warnings.
 
-  Build: make CRYPTO_NONE=yes SCRIPT_PATH=/opt/local/etc/vpnc/vpnc-script
+  Build: ./build-vpnc.sh  (from the repo root)
+         It compiles libgpg-error + libgcrypt FROM SOURCE as static archives
+         (into vendor/deps) and links them statically into vpnc, then runs
+         `make CRYPTO_NONE=yes SCRIPT_PATH=/opt/vpncbar/vpnc-script`. The result
+         depends only on /usr/lib/libSystem — NO MacPorts at build or run time.
          (certificate support is omitted; we use PSK + XAUTH only.)
 
   Certificate auth (IKE Authmode cert/hybrid) is OPTIONAL at build time:

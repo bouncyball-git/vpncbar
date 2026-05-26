@@ -1,11 +1,13 @@
 #!/bin/sh
-# Remove all build artifacts: the VpncBar.app output and the vendored vpnc
-# object files / binaries / generated icon. Source files are left untouched.
+# Remove all build artifacts: the VpncBar.app output, the vendored vpnc objects/
+# binaries, the statically-built crypto deps (libgcrypt + libgpg-error), and the
+# generated icon. Source files are left untouched.
 set -e
 cd "$(dirname "$0")"
+ROOT="$(pwd)"
 
-# So vendor/vpnc/Makefile can find libgcrypt-config while parsing (even for clean).
-export PATH="/opt/local/bin:$PATH"
+# Our static libgcrypt-config (so vendor/vpnc/Makefile parses for the `clean` target).
+export PATH="$ROOT/vendor/deps/bin:$PATH"
 
 echo "Cleaning VpncBar app build (bin/)…"
 rm -rf bin
@@ -16,8 +18,13 @@ if [ -f vendor/vpnc/Makefile ]; then
 fi
 rm -rf vendor/vpnc/bin
 
+echo "Cleaning static crypto deps (vendor/deps: libgcrypt + libgpg-error)…"
+rm -rf vendor/deps
+
 echo "Cleaning generated icon set + logs…"
 rm -rf src/VpncBar.iconset VpncBar.iconset   # intermediate; src/VpncBar.icns is kept
 rm -f ./*.log
 
-echo "Done. Source intact — rebuild with ./build.sh (app) and ./build-vpnc.sh (vpnc)."
+echo "Done. Source intact."
+echo "Rebuild: ./build-vpnc.sh (re-downloads & recompiles libgcrypt + libgpg-error, then vpnc)"
+echo "         ./build.sh       (the app)"
