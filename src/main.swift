@@ -118,6 +118,13 @@ struct Profile: Codable {
     var ocAuthgroup: String? = nil   // openconnect --authgroup
     var ocServerCert: String? = nil  // openconnect --servercert pin (e.g. "pin-sha256:…")
     var ocOtp: Bool? = nil           // openconnect: prompt for a one-time 2FA code on connect
+    // openconnect Options tab:
+    var ocProtocol: String? = nil    // --protocol (anyconnect default; gp/pulse/f5/fortinet/nc/array)
+    var ocNoDTLS: Bool? = nil        // --no-dtls (force TLS transport when UDP/DTLS is blocked)
+    var ocDPD: String? = nil         // --dpd seconds (blank = gateway-negotiated)
+    var ocMTU: String? = nil         // --mtu (blank = automatic)
+    var ocReconnect: String? = nil   // --reconnect-timeout seconds (openconnect default 300)
+    var ocDebug: String? = nil       // verbosity 0/1/2/3/99 → -v… / --dump-http-traffic
 }
 
 // Backend of a profile: defaults to vpnc when unset (back-compat with old profiles).
@@ -505,12 +512,24 @@ func connect(_ p: Profile, otp: String? = nil) -> ActionResult {
 // Build openconnect's argv (without the password, which goes on stdin). Shared by
 // connect and the Info tab's command display. Server is the gateway field.
 func openconnectArgs(_ p: Profile, binary: String) -> [String] {
-    var args = ["-n", binary, "--background", "-v",
+    var args = ["-n", binary, "--background",
                 "--pid-file", pidFile(p),
                 "--script", "\(scriptEnvPrefix(p)) \(kVpncScript)",  // VPNPID → Info tab + scoped DNS
-                "--protocol=anyconnect",
+                "--protocol=\(ne(p.ocProtocol) ?? "anyconnect")",
                 "--passwd-on-stdin",
                 "--user=\(splitDomainUser(p.username).user)"]
+    // Verbosity: 0 none · 1 -v · 2 -vv · 3 -vvv · 99 -vvv + full HTTP dump.
+    switch ne(p.ocDebug) ?? "1" {
+    case "1": args.append("-v")
+    case "2": args.append("-vv")
+    case "3": args.append("-vvv")
+    case "99": args += ["-vvv", "--dump-http-traffic"]
+    default: break   // "0": no extra verbosity
+    }
+    if p.ocNoDTLS ?? false { args.append("--no-dtls") }
+    if let dpd = ne(p.ocDPD) { args += ["--dpd", dpd] }
+    if let mtu = ne(p.ocMTU) { args += ["--mtu", mtu] }
+    if let rc = ne(p.ocReconnect) { args += ["--reconnect-timeout", rc] }
     if let g = ne(p.ocAuthgroup) { args.append("--authgroup=\(g)") }
     if let pin = ne(p.ocServerCert) { args.append("--servercert=\(pin)") }
     if let cert = ne(p.clientCert) { args.append("--certificate=\(cert)") }
@@ -1361,7 +1380,8 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
     private var refreshTimer: Timer?
     private var debugTimer: Timer?   // fast (~0.25s) tail, runs only while Debug tab is visible
     private let tabs = NSTabView()
-    private var optionsTabItem: NSTabViewItem?   // vpnc-only; removed for openconnect
+    private var optionsTabItem: NSTabViewItem?     // vpnc Options
+    private var ocOptionsTabItem: NSTabViewItem?   // openconnect Options
     private var infoTabItem: NSTabViewItem?
     private var debugTabItem: NSTabViewItem?
     private var credsGrid: NSGridView?   // for showing/hiding rows by backend type
@@ -1374,6 +1394,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
     let fetchGroupsButton = NSButton(title: "Fetch groups", target: nil, action: nil)
     let serverCertField = NSTextField()  // openconnect --servercert pin
     let otpCheck = NSButton(checkboxWithTitle: "Ask for one-time code", target: nil, action: nil)
+    let advancedCheck = NSButton(checkboxWithTitle: "Advanced", target: nil, action: nil)  // openconnect: reveal cert fields
     let userField = NSTextField()
     let secretField = RevealableSecureField()
     let passwordField = RevealableSecureField()
@@ -1392,6 +1413,13 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
     let authNote = NSTextField(labelWithString: "")
     let mtuField = NSTextField()
     let dpdField = NSTextField()
+    // openconnect Options tab
+    let ocProtocolPopup = NSPopUpButton()
+    let ocNoDTLSCheck = NSButton(checkboxWithTitle: "Disable DTLS", target: nil, action: nil)
+    let ocDPDField = NSTextField()
+    let ocMTUField = NSTextField()
+    let ocReconnectField = NSTextField()
+    let ocDebugPopup = NSPopUpButton()
     let weakCheck = NSButton(checkboxWithTitle: "Enable weak encryption (3DES)", target: nil, action: nil)
     let singleDESCheck = NSButton(checkboxWithTitle: "Enable single DES", target: nil, action: nil)
     let noEncCheck = NSButton(checkboxWithTitle: "Enable no encryption", target: nil, action: nil)
@@ -1450,6 +1478,11 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         serverCertField.stringValue = profile?.ocServerCert ?? ""
         serverCertField.placeholderString = "(optional) pin-sha256:…"
         otpCheck.state = (profile?.ocOtp ?? false) ? .on : .off
+        // openconnect: hide the rarely-used cert fields behind "Advanced", but expand
+        // it automatically if this profile already has a server-cert pin or client cert.
+        advancedCheck.state = (ne(profile?.ocServerCert) != nil || ne(profile?.clientCert) != nil) ? .on : .off
+        advancedCheck.target = self
+        advancedCheck.action = #selector(advancedChanged)
         authNote.font = .systemFont(ofSize: 11)
         authNote.textColor = .systemOrange
         authNote.maximumNumberOfLines = 2
@@ -1468,6 +1501,17 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         typePopup.target = self
         typePopup.action = #selector(typeChanged)
         typePopup.isEnabled = (profile == nil)   // backend is fixed once the profile exists
+
+        // openconnect Options — pre-filled with openconnect's real defaults.
+        fill(ocProtocolPopup, ["anyconnect", "nc", "gp", "pulse", "f5", "fortinet", "array"],
+             profile?.ocProtocol, "anyconnect")
+        fill(ocDebugPopup, ["0", "1", "2", "3", "99"], profile?.ocDebug, "1")
+        ocNoDTLSCheck.state = (profile?.ocNoDTLS ?? false) ? .on : .off
+        ocDPDField.stringValue = profile?.ocDPD ?? ""
+        ocDPDField.placeholderString = "automatic"
+        ocMTUField.stringValue = profile?.ocMTU ?? ""
+        ocMTUField.placeholderString = "automatic"
+        ocReconnectField.stringValue = profile?.ocReconnect ?? "300"   // openconnect default (seconds)
         fill(authmodePopup, ["psk", "cert", "hybrid"], profile?.authmode, "psk")
         fill(dhPopup, ["dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18"], profile?.dhGroup, "dh2")
         fill(pfsPopup, ["nopfs", "dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18", "server"], profile?.pfs, "server")
@@ -1493,6 +1537,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
             g.column(at: 0).xPlacement = .trailing
             g.rowSpacing = 8
             g.columnSpacing = 10
+            // Center each label with its control (default is first-baseline, which
+            // floats labels above taller controls like pop-ups).
+            for r in 0..<g.numberOfRows { g.row(at: r).yPlacement = .center }
             g.translatesAutoresizingMaskIntoConstraints = false
             return g
         }
@@ -1504,14 +1551,15 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
             [secretLabel, secretField],              // vpnc only
             [label("Auth group"), authgroupField],   // openconnect only
             [label(""), fetchGroupsButton],          // openconnect only
-            [label("Server cert"), serverCertField], // openconnect only
             [label(""), otpCheck],                    // openconnect only
             [label("Username"), userField],
             [label("Password"), passwordField],
             [label("VPN domains"), dnsField],
             [label("IKE Authmode"), authmodePopup],  // vpnc only
+            [label(""), advancedCheck],              // openconnect only — last everyday option
             [caFileLabel, caFileField],              // vpnc only
-            [clientCertLabel, clientCertField],
+            [label("Server cert"), serverCertField], // openconnect only — Advanced
+            [clientCertLabel, clientCertField],      // vpnc (cert mode) / openconnect (Advanced)
             [label(""), authNote],                   // vpnc only
         ])
         self.credsGrid = credsGrid
@@ -1535,10 +1583,20 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
             [label("Encryption"), encStack],
         ])
 
+        let ocOptionsGrid = grid([
+            [label("Protocol"), ocProtocolPopup],
+            [label("Transport"), ocNoDTLSCheck],
+            [label("DPD"), ocDPDField],
+            [label("Interface MTU"), ocMTUField],
+            [label("Reconnect"), ocReconnectField],
+            [label("Debug level"), ocDebugPopup],
+        ])
+
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
             passwordField, dnsField, caFileField, clientCertField, authNote, mtuField, dpdField,
             authmodePopup, dhPopup, pfsPopup, nattPopup, vendorPopup, debugPopup,
-            typePopup, authgroupField, serverCertField]
+            typePopup, authgroupField, serverCertField,
+            ocProtocolPopup, ocDPDField, ocMTUField, ocReconnectField, ocDebugPopup]
         for v in fixedWidth {
             v.translatesAutoresizingMaskIntoConstraints = false
             v.widthAnchor.constraint(equalToConstant: 240).isActive = true
@@ -1560,8 +1618,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         tabs.translatesAutoresizingMaskIntoConstraints = false
         tabs.delegate = self
         tabs.addTabViewItem(tab(credsGrid, "Credentials"))
-        let opts = tab(optionsGrid, "Options"); optionsTabItem = opts
-        tabs.addTabViewItem(opts)
+        optionsTabItem = tab(optionsGrid, "Options")        // vpnc
+        ocOptionsTabItem = tab(ocOptionsGrid, "Options")    // openconnect
+        tabs.addTabViewItem(optionsTabItem!)                // typeChanged() swaps the right one in
         let info = statsTab(); infoTabItem = info
         tabs.addTabViewItem(info)
         let dbg = debugTab(); debugTabItem = dbg
@@ -1866,17 +1925,25 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
     // Gateway, Username, Password, VPN domains, Client cert.
     @objc func typeChanged() {
         let oc = typePopup.titleOfSelectedItem == "openconnect"
+        let adv = oc && (advancedCheck.state == .on)   // openconnect cert fields revealed
         func setRowHidden(_ v: NSView, _ hidden: Bool) { credsGrid?.cell(for: v)?.row?.isHidden = hidden }
         for v in [idField, secretField, authmodePopup, caFileField, authNote] { setRowHidden(v, oc) }
-        for v in [authgroupField, fetchGroupsButton, serverCertField, otpCheck] { setRowHidden(v, !oc) }
-        // The Options tab is all vpnc/IPSec parameters — remove it for openconnect.
-        if let opts = optionsTabItem {
-            let present = tabs.tabViewItems.contains(opts)
-            if oc && present { tabs.removeTabViewItem(opts) }
-            else if !oc && !present { tabs.insertTabViewItem(opts, at: 1) }
+        for v in [authgroupField, fetchGroupsButton, otpCheck, advancedCheck] { setRowHidden(v, !oc) }
+        // openconnect cert fields live under "Advanced". Client cert is shared: vpnc
+        // always shows it (authmode-reactive); openconnect shows it only when Advanced.
+        setRowHidden(serverCertField, !adv)
+        setRowHidden(clientCertField, oc && !adv)
+        // Each backend has its own Options tab — show the matching one (at index 1).
+        if let vpncOpts = optionsTabItem, let ocOpts = ocOptionsTabItem {
+            let want = oc ? ocOpts : vpncOpts
+            let drop = oc ? vpncOpts : ocOpts
+            if tabs.tabViewItems.contains(drop) { tabs.removeTabViewItem(drop) }
+            if !tabs.tabViewItems.contains(want) { tabs.insertTabViewItem(want, at: 1) }
         }
         if !oc { authModeChanged() }   // restore vpnc cert-field graying
     }
+
+    @objc func advancedChanged() { typeChanged() }   // re-evaluate which rows show
 
     // Wizard: one fetch gets the gateway's group list AND each group's 2FA flag.
     // Fills the dropdown and remembers which groups need a one-time code. Manual
@@ -1992,7 +2059,10 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
             extra: existing?.extra,
             kind: oc ? "openconnect" : "vpnc",
             ocAuthgroup: tv(authgroupField), ocServerCert: tv(serverCertField),
-            ocOtp: oc ? (otpCheck.state == .on) : nil)
+            ocOtp: oc ? (otpCheck.state == .on) : nil,
+            ocProtocol: pv(ocProtocolPopup), ocNoDTLS: oc ? (ocNoDTLSCheck.state == .on) : nil,
+            ocDPD: tv(ocDPDField), ocMTU: tv(ocMTUField),
+            ocReconnect: tv(ocReconnectField), ocDebug: pv(ocDebugPopup))
         let secret = secretField.stringValue.isEmpty ? nil : secretField.stringValue
         let password = passwordField.stringValue.isEmpty ? nil : passwordField.stringValue
         onSave(p, secret, password)
