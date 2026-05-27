@@ -34,9 +34,11 @@ sudo install -m 755 vendor/vpnc/src/vpnc-disconnect "$PKG/vpnc-disconnect"
 sudo install -m 755 vendor/vpnc-script              "$PKG/vpnc-script"
 sudo install -m 755 uninstall.sh                    "$PKG/uninstall.sh"
 
-# 4. sudoers: let this user run vpnc/vpnc-disconnect as root without a password.
+# 4. sudoers: let this user run vpnc/vpnc-disconnect (and a system openconnect, for
+#    AnyConnect profiles) as root without a password. The openconnect paths may not
+#    exist — listing them is harmless and covers Homebrew/MacPorts/local installs.
 DEST="/etc/sudoers.d/vpncbar"
-RULE="$USER_NAME ALL=(root) NOPASSWD: $PKG/vpnc, $PKG/vpnc-disconnect"
+RULE="$USER_NAME ALL=(root) NOPASSWD: $PKG/vpnc, $PKG/vpnc-disconnect, /opt/homebrew/bin/openconnect, /opt/local/bin/openconnect, /usr/local/bin/openconnect"
 echo "Installing sudoers rule (sudo): $RULE"
 printf '%s\n' "$RULE" | sudo tee "$DEST" >/dev/null
 sudo chmod 440 "$DEST"

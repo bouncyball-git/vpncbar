@@ -16,6 +16,17 @@ let kOtool = "/usr/bin/otool"
 let kNetstat = "/usr/sbin/netstat"
 let kVpncScript = "/opt/vpncbar/vpnc-script"   // matches the binary's built-in SCRIPT_PATH
 
+// openconnect (AnyConnect/SSL backend) is NOT bundled — we use a system install.
+// Look in the usual Homebrew/MacPorts/local locations; cached. nil if not found.
+private var _openconnect: String?? = nil
+func openconnectPath() -> String? {
+    if let cached = _openconnect { return cached }
+    let found = ["/opt/homebrew/bin/openconnect", "/opt/local/bin/openconnect",
+                 "/usr/local/bin/openconnect"].first { FileManager.default.isExecutableFile(atPath: $0) }
+    _openconnect = found
+    return found
+}
+
 // Whether the installed vpnc was built with a TLS backend (GnuTLS/OpenSSL), i.e.
 // supports IKE Authmode cert/hybrid. Detected from its linked libraries; cached.
 private var _vpncCerts: Bool? = nil
@@ -58,10 +69,14 @@ func logFile(_ p: Profile) -> String {
     return "\(pidDir)/\(id)_\(n).log"
 }
 
-// The exact argv VpncBar launches (Info tab). The profile config — including
-// secrets — is piped to vpnc's stdin (the trailing "-"), so it's not in the argv.
+// The exact argv VpncBar launches (Info tab). Secrets are piped on stdin (vpnc's
+// trailing "-" / openconnect's --passwd-on-stdin), so they're not in the argv.
 func vpncCommandLine(_ p: Profile) -> String {
-    "\(kSudo) -n \(kVpnc) --non-inter --pid-file \(pidFile(p)) --log-file \(logFile(p)) -"
+    if isOpenconnect(p) {
+        let oc = openconnectPath() ?? "openconnect"
+        return "\(kSudo) " + openconnectArgs(p, binary: oc).joined(separator: " ")
+    }
+    return "\(kSudo) -n \(kVpnc) --non-inter --pid-file \(pidFile(p)) --log-file \(logFile(p)) -"
 }
 
 // MARK: - Model
@@ -96,7 +111,16 @@ struct Profile: Codable {
     var noEncryption: Bool? = nil    // Enable no encryption
     var weakAuth: Bool? = nil        // Enable weak authentication
     var extra: [String]? = nil       // verbatim vpnc.conf directives
+    // Backend: nil/"vpnc" => Cisco IPSec via bundled vpnc; "openconnect" => AnyConnect
+    // SSL via system openconnect. For openconnect we reuse gateway(=server),
+    // username, password, dnsMatchDomains, clientCert.
+    var kind: String? = nil          // "vpnc" (default) | "openconnect"
+    var ocAuthgroup: String? = nil   // openconnect --authgroup
+    var ocServerCert: String? = nil  // openconnect --servercert pin (e.g. "pin-sha256:…")
 }
+
+// Backend of a profile: defaults to vpnc when unset (back-compat with old profiles).
+func isOpenconnect(_ p: Profile) -> Bool { (p.kind ?? "vpnc") == "openconnect" }
 
 // Trimmed non-empty value, or nil.
 func ne(_ s: String?) -> String? {
@@ -298,12 +322,13 @@ func formatElapsed(_ secs: Int) -> String {
     return String(format: "%d:%02d", m, s)
 }
 
-// Elapsed seconds for a live vpnc with this pid, or nil if it isn't a running vpnc.
+// Elapsed seconds for a live tunnel daemon (vpnc or openconnect) with this pid.
 func vpncElapsed(pid: Int) -> Int? {
     let r = run(kPs, ["-p", "\(pid)", "-o", "comm=,etime="])
     guard r.status == 0 else { return nil }
     let line = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard line.contains("vpnc"), let etok = line.split(separator: " ").last else { return nil }
+    guard line.contains("vpnc") || line.contains("openconnect"),
+          let etok = line.split(separator: " ").last else { return nil }
     return parseEtime(String(etok))
 }
 
@@ -322,7 +347,9 @@ func connectedTunnels(_ profiles: [Profile]) -> [String: (pid: Int, secs: Int)] 
     if r.status == 0 {
         for raw in r.out.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.contains("/vpnc"), let pf = line.range(of: "--pid-file ") else { continue }
+            // Both backends carry "--pid-file …/<uuid>-<name>.pid"; match either binary.
+            guard line.contains("/vpnc") || line.contains("/openconnect"),
+                  let pf = line.range(of: "--pid-file ") else { continue }
             guard let pathTok = line[pf.upperBound...].split(separator: " ").first else { continue }
             let base = (String(pathTok) as NSString).lastPathComponent
             guard base.hasSuffix(".pid") else { continue }
@@ -373,9 +400,11 @@ func resolveGatewayIP(_ host: String) -> String {
 }
 
 func connect(_ p: Profile) -> ActionResult {
-    // Safeguard: never launch a second vpnc for a profile that's already up
+    // Safeguard: never launch a second daemon for a profile that's already up
     // (a duplicate would fight over the same pidfile and re-resolve the gateway).
     if !connectedTunnels([p]).isEmpty { return .ok }
+
+    if isOpenconnect(p) { return connectOpenconnect(p) }
 
     let authmode = ne(p.authmode) ?? "psk"
     let usesCert = (authmode == "cert" || authmode == "hybrid")
@@ -462,6 +491,38 @@ func connect(_ p: Profile) -> ActionResult {
         .trimmingCharacters(in: .whitespacesAndNewlines).suffix(600)
     let detail = (tail.map(String.init) ?? "").isEmpty ? (r.err.isEmpty ? r.out : r.err) : String(tail!)
     return .message("vpnc failed (status \(r.status)):\n\(detail)")
+}
+
+// Build openconnect's argv (without the password, which goes on stdin). Shared by
+// connect and the Info tab's command display. Server is the gateway field.
+func openconnectArgs(_ p: Profile, binary: String) -> [String] {
+    var args = ["-n", binary, "--background",
+                "--pid-file", pidFile(p),
+                "--script", kVpncScript,
+                "--protocol=anyconnect",
+                "--passwd-on-stdin",
+                "--user=\(splitDomainUser(p.username).user)"]
+    if let g = ne(p.ocAuthgroup) { args.append("--authgroup=\(g)") }
+    if let pin = ne(p.ocServerCert) { args.append("--servercert=\(pin)") }
+    if let cert = ne(p.clientCert) { args.append("--certificate=\(cert)") }
+    args.append(p.gateway)   // server (URL or host)
+    return args
+}
+
+// Connect an openconnect (AnyConnect SSL) profile via a system openconnect, reusing
+// our vpnc-script for routes/scoped-DNS. Password is piped on stdin.
+func connectOpenconnect(_ p: Profile) -> ActionResult {
+    guard let oc = openconnectPath() else {
+        return .message("openconnect isn't installed.\nInstall it:  brew install openconnect")
+    }
+    let password = keychainSecret(kcService(p, "password")) ?? ""
+    let r = run(kSudo, openconnectArgs(p, binary: oc), stdin: password + "\n")
+    if r.status == 0 { return .ok }
+    if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
+        return .message("sudo needs a password.\nRe-run the installer so openconnect is allowed passwordless.")
+    }
+    let detail = r.err.isEmpty ? r.out : r.err
+    return .message("openconnect failed (status \(r.status)):\n\(detail.suffix(600))")
 }
 
 // Disconnect one profile. Prefer the live PID discovered from `ps` (works even
@@ -624,6 +685,16 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
     private var lastConnected: Set<String>?   // nil until first poll (no notification at launch)
 
     func start() {
+        // Single instance: every copy (bin/, /Applications, …) shares this bundle id,
+        // so launching another copy would run a second menu-bar icon. If one is
+        // already running, quit this one immediately — exit() (not NSApp.terminate)
+        // so we DON'T run the disconnect-all teardown and tear down the other's tunnels.
+        let bid = Bundle.main.bundleIdentifier ?? "local.vpncbar"
+        if NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            .contains(where: { $0 != .current }) {
+            exit(0)
+        }
+
         try? FileManager.default.createDirectory(atPath: pidDir, withIntermediateDirectories: true)
         migrateProfilesToUUID()   // give existing profiles a stable uuid + move their Keychain items
         statusItem.menu = NSMenu()
@@ -1200,9 +1271,13 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     private let tabs = NSTabView()
     private var infoTabItem: NSTabViewItem?
     private var debugTabItem: NSTabViewItem?
+    private var credsGrid: NSGridView?   // for showing/hiding rows by backend type
+    let typePopup = NSPopUpButton()      // vpnc | openconnect
     let nameField = NSTextField()
     let gatewayField = NSTextField()
     let idField = NSTextField()
+    let authgroupField = NSTextField()   // openconnect --authgroup
+    let serverCertField = NSTextField()  // openconnect --servercert pin
     let userField = NSTextField()
     let secretField = RevealableSecureField()
     let passwordField = RevealableSecureField()
@@ -1269,6 +1344,10 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         caFileField.placeholderString = "/path/to/ca.pem"
         clientCertField.stringValue = profile?.clientCert ?? ""
         clientCertField.placeholderString = "/path/to/client.pem"
+        authgroupField.stringValue = profile?.ocAuthgroup ?? ""
+        authgroupField.placeholderString = "(optional) auth group"
+        serverCertField.stringValue = profile?.ocServerCert ?? ""
+        serverCertField.placeholderString = "(optional) pin-sha256:…"
         authNote.font = .systemFont(ofSize: 11)
         authNote.textColor = .systemOrange
         authNote.maximumNumberOfLines = 2
@@ -1283,6 +1362,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             p.addItems(withTitles: items)
             p.selectItem(withTitle: (value.flatMap { items.contains($0) ? $0 : nil }) ?? def)
         }
+        fill(typePopup, ["vpnc", "openconnect"], profile?.kind, "vpnc")
+        typePopup.target = self
+        typePopup.action = #selector(typeChanged)
         fill(authmodePopup, ["psk", "cert", "hybrid"], profile?.authmode, "psk")
         fill(dhPopup, ["dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18"], profile?.dhGroup, "dh2")
         fill(pfsPopup, ["nopfs", "dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18", "server"], profile?.pfs, "server")
@@ -1312,18 +1394,22 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             return g
         }
         let credsGrid = grid([
+            [label("Type"), typePopup],
             [label("Name"), nameField],
             [label("Gateway"), gatewayField],
-            [label("Group name"), idField],
-            [secretLabel, secretField],
+            [label("Group name"), idField],          // vpnc only
+            [secretLabel, secretField],              // vpnc only
+            [label("Auth group"), authgroupField],   // openconnect only
+            [label("Server cert"), serverCertField], // openconnect only
             [label("Username"), userField],
             [label("Password"), passwordField],
             [label("VPN domains"), dnsField],
-            [label("IKE Authmode"), authmodePopup],
-            [caFileLabel, caFileField],
+            [label("IKE Authmode"), authmodePopup],  // vpnc only
+            [caFileLabel, caFileField],              // vpnc only
             [clientCertLabel, clientCertField],
-            [label(""), authNote],
+            [label(""), authNote],                   // vpnc only
         ])
+        self.credsGrid = credsGrid
         let optionsGrid = grid([
             [label("DH Group"), dhPopup],
             [label("PFS"), pfsPopup],
@@ -1337,7 +1423,8 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
 
         let fixedWidth: [NSView] = [nameField, gatewayField, idField, userField, secretField,
             passwordField, dnsField, caFileField, clientCertField, authNote, mtuField, dpdField,
-            authmodePopup, dhPopup, pfsPopup, nattPopup, vendorPopup, debugPopup]
+            authmodePopup, dhPopup, pfsPopup, nattPopup, vendorPopup, debugPopup,
+            typePopup, authgroupField, serverCertField]
         for v in fixedWidth {
             v.translatesAutoresizingMaskIntoConstraints = false
             v.widthAnchor.constraint(equalToConstant: 240).isActive = true
@@ -1391,7 +1478,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
             buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
         ])
-        authModeChanged()   // set initial enabled/grayed state for the auth fields
+        typeChanged()       // show/hide rows for the backend, then set auth-field state
 
         // Info tab refreshes live (cheap). Debug only refreshes while its tab is
         // visible (the system-log query is slow) — loaded on selection + throttled.
@@ -1653,6 +1740,17 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         return raw
     }
 
+    // Show only the rows relevant to the chosen backend. vpnc: Group name/secret,
+    // IKE Authmode, CA file. openconnect: Auth group, Server cert. Shared: Name,
+    // Gateway, Username, Password, VPN domains, Client cert.
+    @objc func typeChanged() {
+        let oc = typePopup.titleOfSelectedItem == "openconnect"
+        func setRowHidden(_ v: NSView, _ hidden: Bool) { credsGrid?.cell(for: v)?.row?.isHidden = hidden }
+        for v in [idField, secretField, authmodePopup, caFileField, authNote] { setRowHidden(v, oc) }
+        for v in [authgroupField, serverCertField] { setRowHidden(v, !oc) }
+        if !oc { authModeChanged() }   // restore vpnc cert-field graying
+    }
+
     // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid
     // use the CA file. Whichever isn't relevant is grayed out. If this vpnc has no
     // TLS backend, cert/hybrid stay selectable but their fields are grayed and a
@@ -1689,13 +1787,22 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     }
 
     @objc func saveTapped() {
+        let oc = typePopup.titleOfSelectedItem == "openconnect"
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
         let gw = gatewayField.stringValue.trimmingCharacters(in: .whitespaces)
         let id = idField.stringValue.trimmingCharacters(in: .whitespaces)
         let user = userField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !gw.isEmpty, !id.isEmpty, !user.isEmpty else {
-            alert("Name, Gateway, Group name and Username are all required.")
-            return
+        // Group name is vpnc-only; openconnect needs only Name, Server, Username.
+        if oc {
+            guard !name.isEmpty, !gw.isEmpty, !user.isEmpty else {
+                alert("Name, Server and Username are required.")
+                return
+            }
+        } else {
+            guard !name.isEmpty, !gw.isEmpty, !id.isEmpty, !user.isEmpty else {
+                alert("Name, Gateway, Group name and Username are all required.")
+                return
+            }
         }
         func pv(_ p: NSPopUpButton) -> String? { p.titleOfSelectedItem }
         func tv(_ f: NSTextField) -> String? { ne(f.stringValue) }
@@ -1715,7 +1822,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             dpdTimeout: tv(dpdField), debug: pv(debugPopup),
             enableWeak: weakCheck.state == .on, singleDES: singleDESCheck.state == .on,
             noEncryption: noEncCheck.state == .on, weakAuth: weakAuthCheck.state == .on,
-            extra: existing?.extra)
+            extra: existing?.extra,
+            kind: oc ? "openconnect" : "vpnc",
+            ocAuthgroup: tv(authgroupField), ocServerCert: tv(serverCertField))
         let secret = secretField.stringValue.isEmpty ? nil : secretField.stringValue
         let password = passwordField.stringValue.isEmpty ? nil : passwordField.stringValue
         onSave(p, secret, password)

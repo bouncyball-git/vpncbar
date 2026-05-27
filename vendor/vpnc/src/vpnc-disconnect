@@ -39,11 +39,12 @@ if ! kill -0 "$PID" >/dev/null 2>&1; then
 	exit 1
 fi
 
-# Safety: only signal the PID if it really is a vpnc process.
-if ! ps -p "$PID" -o comm= 2>/dev/null | grep -q vpnc; then
-	echo "pid $PID is not a vpnc process; refusing to kill" 1>&2
+# Safety: only signal the PID if it really is a vpnc OR openconnect process
+# (VpncBar uses this for both backends; openconnect tears down via SIGTERM too).
+if ! ps -p "$PID" -o comm= 2>/dev/null | grep -qE 'vpnc|openconnect'; then
+	echo "pid $PID is not a vpnc/openconnect process; refusing to kill" 1>&2
 	exit 1
 fi
 
-echo "Terminating vpnc daemon (pid: $PID)"
+echo "Terminating VPN daemon (pid: $PID)"
 exec kill "$PID"

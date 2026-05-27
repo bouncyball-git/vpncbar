@@ -118,7 +118,7 @@ build_pkg() {
 #!/bin/sh
 USER_NAME=$(stat -f "%Su" /dev/console)
 DEST=/etc/sudoers.d/vpncbar
-printf '%s ALL=(root) NOPASSWD: /opt/vpncbar/vpnc, /opt/vpncbar/vpnc-disconnect\n' "$USER_NAME" > "$DEST"
+printf '%s ALL=(root) NOPASSWD: /opt/vpncbar/vpnc, /opt/vpncbar/vpnc-disconnect, /opt/homebrew/bin/openconnect, /opt/local/bin/openconnect, /usr/local/bin/openconnect\n' "$USER_NAME" > "$DEST"
 chmod 440 "$DEST"
 visudo -cf "$DEST" >/dev/null 2>&1 || rm -f "$DEST"
 exit 0
