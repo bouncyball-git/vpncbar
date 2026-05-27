@@ -117,6 +117,7 @@ struct Profile: Codable {
     var kind: String? = nil          // "vpnc" (default) | "openconnect"
     var ocAuthgroup: String? = nil   // openconnect --authgroup
     var ocServerCert: String? = nil  // openconnect --servercert pin (e.g. "pin-sha256:…")
+    var ocOtp: Bool? = nil           // openconnect: prompt for a one-time 2FA code on connect
 }
 
 // Backend of a profile: defaults to vpnc when unset (back-compat with old profiles).
@@ -399,12 +400,27 @@ func resolveGatewayIP(_ host: String) -> String {
     return gatewayIPCache[host] ?? host   // fall back to last good IP, else the hostname
 }
 
-func connect(_ p: Profile) -> ActionResult {
+// "VPNPID='…' [VPNC_MATCH_DOMAINS='…']" — env prefix for our vpnc-script. VPNPID
+// pins the per-tunnel stats file (/var/run/vpncbar/<uuid>.info) so the Info tab
+// works; VPNC_MATCH_DOMAINS drives scoped DNS. Shared by vpnc's "Script" directive
+// and openconnect's "--script" (both run the value via /bin/sh, so the env sticks).
+func scriptEnvPrefix(_ p: Profile) -> String {
+    var s = "VPNPID='\(p.uuid ?? p.name)'"
+    if let raw = ne(p.dnsMatchDomains) {
+        let domains = String(raw.map { ", ".contains($0) ? " " : $0 })
+            .filter { $0.isLetter || $0.isNumber || ". -_".contains($0) }
+            .split(separator: " ").joined(separator: " ")
+        if !domains.isEmpty { s += " VPNC_MATCH_DOMAINS='\(domains)'" }
+    }
+    return s
+}
+
+func connect(_ p: Profile, otp: String? = nil) -> ActionResult {
     // Safeguard: never launch a second daemon for a profile that's already up
     // (a duplicate would fight over the same pidfile and re-resolve the gateway).
     if !connectedTunnels([p]).isEmpty { return .ok }
 
-    if isOpenconnect(p) { return connectOpenconnect(p) }
+    if isOpenconnect(p) { return connectOpenconnect(p, otp: otp) }
 
     let authmode = ne(p.authmode) ?? "psk"
     let usesCert = (authmode == "cert" || authmode == "hybrid")
@@ -460,14 +476,7 @@ func connect(_ p: Profile) -> ActionResult {
     // files (resolv.conf-backup, defaultroute) are keyed consistently across connect
     // and disconnect — vpnc's daemonizing fork otherwise changes the derived pid and
     // orphans the backups. VPNC_MATCH_DOMAINS carries the scoped-DNS domains.
-    var scriptCmd = "VPNPID='\(p.uuid ?? p.name)'"
-    if let raw = ne(p.dnsMatchDomains) {
-        let domains = String(raw.map { ", ".contains($0) ? " " : $0 })
-            .filter { $0.isLetter || $0.isNumber || ". -_".contains($0) }
-            .split(separator: " ").joined(separator: " ")
-        if !domains.isEmpty { scriptCmd += " VPNC_MATCH_DOMAINS='\(domains)'" }
-    }
-    lines.append("Script \(scriptCmd) \(kVpncScript)")
+    lines.append("Script \(scriptEnvPrefix(p)) \(kVpncScript)")
     lines.append(contentsOf: p.extra ?? [])
     let config = lines.joined(separator: "\n") + "\n"
 
@@ -496,9 +505,9 @@ func connect(_ p: Profile) -> ActionResult {
 // Build openconnect's argv (without the password, which goes on stdin). Shared by
 // connect and the Info tab's command display. Server is the gateway field.
 func openconnectArgs(_ p: Profile, binary: String) -> [String] {
-    var args = ["-n", binary, "--background",
+    var args = ["-n", binary, "--background", "-v",
                 "--pid-file", pidFile(p),
-                "--script", kVpncScript,
+                "--script", "\(scriptEnvPrefix(p)) \(kVpncScript)",  // VPNPID → Info tab + scoped DNS
                 "--protocol=anyconnect",
                 "--passwd-on-stdin",
                 "--user=\(splitDomainUser(p.username).user)"]
@@ -510,19 +519,59 @@ func openconnectArgs(_ p: Profile, binary: String) -> [String] {
 }
 
 // Connect an openconnect (AnyConnect SSL) profile via a system openconnect, reusing
-// our vpnc-script for routes/scoped-DNS. Password is piped on stdin.
-func connectOpenconnect(_ p: Profile) -> ActionResult {
+// our vpnc-script for routes/scoped-DNS. openconnect reads one value per form prompt
+// from stdin: the account password, then (for 2FA groups) the one-time code.
+func connectOpenconnect(_ p: Profile, otp: String? = nil) -> ActionResult {
     guard let oc = openconnectPath() else {
         return .message("openconnect isn't installed.\nInstall it:  brew install openconnect")
     }
     let password = keychainSecret(kcService(p, "password")) ?? ""
-    let r = run(kSudo, openconnectArgs(p, binary: oc), stdin: password + "\n")
-    if r.status == 0 { return .ok }
-    if r.err.lowercased().contains("password") && r.err.lowercased().contains("sudo") {
+    var input = password + "\n"
+    if let otp = ne(otp) { input += otp + "\n" }
+
+    // Fresh, user-owned log; openconnect's stdout/stderr go here and the --background
+    // daemon inherits the fd, so the Debug tab can tail the whole session.
+    try? FileManager.default.removeItem(atPath: logFile(p))
+    FileManager.default.createFile(atPath: logFile(p), contents: nil)
+    let logFH = FileHandle(forWritingAtPath: logFile(p))
+
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: kSudo)
+    proc.arguments = openconnectArgs(p, binary: oc)
+    let inPipe = Pipe()
+    proc.standardInput = inPipe
+    if let logFH { proc.standardOutput = logFH; proc.standardError = logFH }
+    do { try proc.run() } catch {
+        return .message("Couldn't launch openconnect: \(error.localizedDescription)")
+    }
+    inPipe.fileHandleForWriting.write(Data(input.utf8))
+    inPipe.fileHandleForWriting.closeFile()
+    proc.waitUntilExit()
+    logFH?.closeFile()   // our handle; the backgrounded daemon keeps its own copy
+
+    if proc.terminationStatus == 0 { return .ok }
+    // Output went to the log file, so read its tail for the error detail.
+    let tail = (try? String(contentsOfFile: logFile(p), encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if tail.lowercased().contains("sudo") && tail.lowercased().contains("password") {
         return .message("sudo needs a password.\nRe-run the installer so openconnect is allowed passwordless.")
     }
-    let detail = r.err.isEmpty ? r.out : r.err
-    return .message("openconnect failed (status \(r.status)):\n\(detail.suffix(600))")
+    return .message("openconnect failed (status \(proc.terminationStatus)):\n\(String(tail.suffix(600)))")
+}
+
+// Prompt (on the main thread) for a one-time 2FA code before connecting an
+// openconnect profile that needs one. Returns the code, or nil if cancelled.
+func promptOTP(_ p: Profile) -> String? {
+    let a = NSAlert()
+    a.messageText = "One-time code for “\(p.name)”"
+    a.informativeText = "Enter the current 2FA code (e.g. from Google Authenticator)."
+    a.addButton(withTitle: "Connect")
+    a.addButton(withTitle: "Cancel")
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+    a.accessoryView = field
+    NSApp.activate(ignoringOtherApps: true)
+    a.window.initialFirstResponder = field
+    return a.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
 }
 
 // Disconnect one profile. Prefer the live PID discovered from `ps` (works even
@@ -622,6 +671,10 @@ final class ProfileMenuItemView: NSView {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 22))
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    // Give AppKit a fixed size so it doesn't re-guess the menu's geometry during
+    // hover/dismiss (which could leave extra padding at the menu's bottom).
+    override var intrinsicContentSize: NSSize { NSSize(width: frame.width, height: 22) }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -872,6 +925,9 @@ final class AppController: NSObject, UNUserNotificationCenterDelegate, NSMenuDel
         guard let p = loadProfiles().first(where: { $0.name == name }) else { return }
         if !connectedTunnels([p]).isEmpty {
             perform { disconnect(p) }
+        } else if isOpenconnect(p) && (p.ocOtp ?? false) {
+            guard let code = promptOTP(p) else { return }   // cancelled
+            perform { connect(p, otp: code) }
         } else {
             perform { connect(p) }
         }
@@ -1269,6 +1325,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     private var refreshTimer: Timer?
     private var debugTimer: Timer?   // fast (~0.25s) tail, runs only while Debug tab is visible
     private let tabs = NSTabView()
+    private var optionsTabItem: NSTabViewItem?   // vpnc-only; removed for openconnect
     private var infoTabItem: NSTabViewItem?
     private var debugTabItem: NSTabViewItem?
     private var credsGrid: NSGridView?   // for showing/hiding rows by backend type
@@ -1278,6 +1335,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     let idField = NSTextField()
     let authgroupField = NSTextField()   // openconnect --authgroup
     let serverCertField = NSTextField()  // openconnect --servercert pin
+    let otpCheck = NSButton(checkboxWithTitle: "Ask for one-time code (2FA) on connect", target: nil, action: nil)
     let userField = NSTextField()
     let secretField = RevealableSecureField()
     let passwordField = RevealableSecureField()
@@ -1348,6 +1406,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         authgroupField.placeholderString = "(optional) auth group"
         serverCertField.stringValue = profile?.ocServerCert ?? ""
         serverCertField.placeholderString = "(optional) pin-sha256:…"
+        otpCheck.state = (profile?.ocOtp ?? false) ? .on : .off
         authNote.font = .systemFont(ofSize: 11)
         authNote.textColor = .systemOrange
         authNote.maximumNumberOfLines = 2
@@ -1401,6 +1460,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             [secretLabel, secretField],              // vpnc only
             [label("Auth group"), authgroupField],   // openconnect only
             [label("Server cert"), serverCertField], // openconnect only
+            [label(""), otpCheck],                    // openconnect only
             [label("Username"), userField],
             [label("Password"), passwordField],
             [label("VPN domains"), dnsField],
@@ -1446,7 +1506,8 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         tabs.translatesAutoresizingMaskIntoConstraints = false
         tabs.delegate = self
         tabs.addTabViewItem(tab(credsGrid, "Credentials"))
-        tabs.addTabViewItem(tab(optionsGrid, "Options"))
+        let opts = tab(optionsGrid, "Options"); optionsTabItem = opts
+        tabs.addTabViewItem(opts)
         let info = statsTab(); infoTabItem = info
         tabs.addTabViewItem(info)
         let dbg = debugTab(); debugTabItem = dbg
@@ -1590,13 +1651,19 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     @objc private func toggleTapped() {
         guard let p = existing else { return }
         let connected = !connectedTunnels([p]).isEmpty
+        // 2FA openconnect: gather the one-time code (main thread) before connecting.
+        var otp: String? = nil
+        if !connected && isOpenconnect(p) && (p.ocOtp ?? false) {
+            guard let code = promptOTP(p) else { return }   // cancelled
+            otp = code
+        }
         toggling = true
         transition = connected ? "Disconnecting…" : "Connecting…"   // shown in Status row
         transitionDeadline = Date().addingTimeInterval(20)
         toggleButton.isEnabled = false   // keep its Connect/Disconnect label, just block re-clicks
         refreshStats()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = connected ? disconnect(p) : connect(p)
+            let result = connected ? disconnect(p) : connect(p, otp: otp)
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 // On failure, end the transition now and report. On success, leave it:
@@ -1747,7 +1814,13 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         let oc = typePopup.titleOfSelectedItem == "openconnect"
         func setRowHidden(_ v: NSView, _ hidden: Bool) { credsGrid?.cell(for: v)?.row?.isHidden = hidden }
         for v in [idField, secretField, authmodePopup, caFileField, authNote] { setRowHidden(v, oc) }
-        for v in [authgroupField, serverCertField] { setRowHidden(v, !oc) }
+        for v in [authgroupField, serverCertField, otpCheck] { setRowHidden(v, !oc) }
+        // The Options tab is all vpnc/IPSec parameters — remove it for openconnect.
+        if let opts = optionsTabItem {
+            let present = tabs.tabViewItems.contains(opts)
+            if oc && present { tabs.removeTabViewItem(opts) }
+            else if !oc && !present { tabs.insertTabViewItem(opts, at: 1) }
+        }
         if !oc { authModeChanged() }   // restore vpnc cert-field graying
     }
 
@@ -1824,7 +1897,8 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             noEncryption: noEncCheck.state == .on, weakAuth: weakAuthCheck.state == .on,
             extra: existing?.extra,
             kind: oc ? "openconnect" : "vpnc",
-            ocAuthgroup: tv(authgroupField), ocServerCert: tv(serverCertField))
+            ocAuthgroup: tv(authgroupField), ocServerCert: tv(serverCertField),
+            ocOtp: oc ? (otpCheck.state == .on) : nil)
         let secret = secretField.stringValue.isEmpty ? nil : secretField.stringValue
         let password = passwordField.stringValue.isEmpty ? nil : passwordField.stringValue
         onSave(p, secret, password)
