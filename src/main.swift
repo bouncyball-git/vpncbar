@@ -619,6 +619,17 @@ func promptOTP(_ p: Profile) -> String? {
     a.accessoryView = field
     NSApp.activate(ignoringOtherApps: true)
     a.window.initialFirstResponder = field
+    // The insertion-point caret only draws when the window is actually key. In an
+    // LSUIElement app NSApp.activate is async, so focusing early leaves the caret in
+    // the "off" state. Hook the window's didBecomeKey (delivered synchronously during
+    // runModal) and selectText *then* — at that point the window is key and the caret
+    // is drawn immediately.
+    let token = NotificationCenter.default.addObserver(
+        forName: NSWindow.didBecomeKeyNotification, object: a.window, queue: nil) { _ in
+        a.window.makeFirstResponder(field)
+        field.selectText(nil)
+    }
+    defer { NotificationCenter.default.removeObserver(token) }
     return a.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
 }
 
@@ -1311,12 +1322,18 @@ final class AboutWindow: NSObject {
 /// Top-origin view so the scrolled form starts at the top, not the bottom.
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
+/// A button that shows the standard arrow cursor instead of inheriting the I-beam
+/// cursor rect of the text field it's overlaid on.
+final class ArrowButton: NSButton {
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .arrow) }
+}
+
 /// A password field with an eye toggle to reveal/hide the value. Internally swaps
 /// a masked NSSecureTextField with a plain NSTextField, keeping their value in sync.
 final class RevealableSecureField: NSView {
     private let secure = NSSecureTextField()
     private let plain = NSTextField()
-    private let eye = NSButton()
+    private let eye = ArrowButton()
     private var revealed = false
 
     var stringValue: String {
