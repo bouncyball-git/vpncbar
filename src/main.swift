@@ -1471,6 +1471,15 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             [label(""), authNote],                   // vpnc only
         ])
         self.credsGrid = credsGrid
+        // Pin the label column to the widest label across ALL rows, so hiding/showing
+        // rows per backend doesn't change its width (which would slide the fields).
+        let labelFont = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let widest = ["Type", "Name", "Gateway", "Group name", "Group secret", "Auth group",
+                      "Server cert", "Username", "Password", "VPN domains", "IKE Authmode",
+                      "CA file", "Client cert"]
+            .map { ($0 as NSString).size(withAttributes: [.font: labelFont]).width }.max() ?? 90
+        credsGrid.column(at: 0).width = ceil(widest) + 2
+
         let optionsGrid = grid([
             [label("DH Group"), dhPopup],
             [label("PFS"), pfsPopup],
