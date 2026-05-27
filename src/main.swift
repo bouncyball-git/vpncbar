@@ -1335,7 +1335,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     let idField = NSTextField()
     let authgroupField = NSTextField()   // openconnect --authgroup
     let serverCertField = NSTextField()  // openconnect --servercert pin
-    let otpCheck = NSButton(checkboxWithTitle: "Ask for one-time code (2FA) on connect", target: nil, action: nil)
+    let otpCheck = NSButton(checkboxWithTitle: "Ask for one-time code", target: nil, action: nil)
     let userField = NSTextField()
     let secretField = RevealableSecureField()
     let passwordField = RevealableSecureField()
@@ -1424,6 +1424,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         fill(typePopup, ["vpnc", "openconnect"], profile?.kind, "vpnc")
         typePopup.target = self
         typePopup.action = #selector(typeChanged)
+        typePopup.isEnabled = (profile == nil)   // backend is fixed once the profile exists
         fill(authmodePopup, ["psk", "cert", "hybrid"], profile?.authmode, "psk")
         fill(dhPopup, ["dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18"], profile?.dhGroup, "dh2")
         fill(pfsPopup, ["nopfs", "dh1", "dh2", "dh5", "dh14", "dh15", "dh16", "dh17", "dh18", "server"], profile?.pfs, "server")
