@@ -1177,7 +1177,7 @@ final class AboutWindow: NSObject {
     let window: NSWindow
 
     override init() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 360),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "About VpncBar"
         window.isReleasedWhenClosed = false
@@ -1200,6 +1200,9 @@ final class AboutWindow: NSObject {
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
         let vpncVer = run(kVpnc, ["--version"]).out.split(separator: "\n").first.map(String.init)
             ?? "vpnc (version unknown)"
+        let ocVer = openconnectPath().map {
+            run($0, ["--version"]).out.split(separator: "\n").first.map(String.init) ?? "openconnect"
+        } ?? "openconnect: not installed (brew install openconnect)"
 
         let icon = NSImageView()
         icon.image = NSApp.applicationIconImage
@@ -1213,12 +1216,15 @@ final class AboutWindow: NSObject {
         let uninstall = NSButton(title: "Uninstall VpncBar…", target: self, action: #selector(uninstallTapped))
         uninstall.bezelStyle = .rounded
 
+        let vpncLine = label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 300)
+        let ocLine = label("\(ocVer)  ·  LGPLv2.1", 11, color: .secondaryLabelColor, width: 300)
         let stack = NSStackView(views: [
             icon,
             label("VpncBar", 22, bold: true),
             label("Version \(version)", 12, color: .secondaryLabelColor),
-            label("A native macOS menu-bar front-end for the vpnc Cisco IPSec VPN client, using the kernel's native utun interface.", 12, width: 300),
-            label("Bundled \(vpncVer)  ·  GPLv2", 11, color: .secondaryLabelColor, width: 300),
+            label("A native macOS menu-bar front-end for vpnc (Cisco IPSec) and openconnect (Cisco AnyConnect SSL).", 12, width: 300),
+            vpncLine,
+            ocLine,
             link,
             uninstall,
         ])
@@ -1226,6 +1232,7 @@ final class AboutWindow: NSObject {
         stack.alignment = .centerX
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setCustomSpacing(1, after: vpncLine)   // keep the two backend rows together
 
         let content = NSView()
         content.addSubview(stack)

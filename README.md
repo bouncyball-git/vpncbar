@@ -1,10 +1,14 @@
 # VpncBar
 
-A native macOS menu-bar front-end for the [`vpnc`](https://en.wikipedia.org/wiki/Vpnc)
-Cisco IPSec VPN client. VpncBar ships with its own copy of `vpnc`, patched to use
-the kernel's native **utun** interface, so it runs on Apple Silicon and modern
-macOS without the long-dead `tuntaposx` kext — and that `vpnc` is **statically
-linked**, so there are no MacPorts/Homebrew runtime dependencies.
+A native macOS menu-bar front-end for **two** VPN backends:
+
+- **`vpnc`** — Cisco IPSec (IKEv1 + XAUTH). VpncBar ships its own copy, patched to
+  use the kernel's native **utun** interface (runs on Apple Silicon / modern macOS
+  without the long-dead `tuntaposx` kext) and **statically linked**, so it has no
+  MacPorts/Homebrew runtime dependency.
+- **`openconnect`** — Cisco **AnyConnect** SSL (and compatible). Uses a system
+  `openconnect` and the **same network-config script** as vpnc, with a guided setup
+  that fetches the gateway's group list and detects per-group 2FA.
 
 It's a small AppKit app (no Xcode project, no dependencies beyond the system
 frameworks) that lives in the status bar and lets you manage profiles, store
@@ -21,6 +25,7 @@ secrets in the Keychain, and bring tunnels up and down with a click.
   - [Multiple simultaneous connections](#multiple-simultaneous-connections)
   - [Live elapsed timer](#live-elapsed-timer)
   - [Profile editor](#profile-editor)
+  - [AnyConnect / OpenConnect profiles](#anyconnect--openconnect-profiles)
   - [Info tab — live tunnel state](#info-tab--live-tunnel-state)
   - [Debug tab — vpnc logs](#debug-tab--vpnc-logs)
   - [Keychain-backed secrets](#keychain-backed-secrets)
@@ -72,8 +77,11 @@ secrets in the Keychain, and bring tunnels up and down with a click.
 
 ### Profile editor
 
-One editor window per profile (opening it again just brings it forward). Four
-tabs, plus a **Connect/Disconnect** button whose label tracks the live state:
+One editor window per profile (opening it again just brings it forward). A
+**Type** selector (vpnc | openconnect — locked once the profile is saved) switches
+the fields and tabs to match the backend; below covers a **vpnc** profile (for
+openconnect see [AnyConnect / OpenConnect profiles](#anyconnect--openconnect-profiles)).
+Up to four tabs, plus a **Connect/Disconnect** button whose label tracks the live state:
 
 **Credentials**
 - Name, Gateway, Group name, Group secret, Username, Password.
@@ -105,6 +113,31 @@ selected IKE Authmode, so only the relevant credentials are editable:
 If your `vpnc` binary was built **without** TLS/SSL, choosing `hybrid`/`cert`
 shows a note explaining the cert fields won't take effect (see
 [Certificate support](#certificate-support)).
+
+### AnyConnect / OpenConnect profiles
+
+Set a profile's **Type** to **openconnect** to connect to a Cisco **AnyConnect**
+SSL gateway via a system `openconnect` (Homebrew/MacPorts). The editor swaps to the
+relevant fields — **Gateway** (server), **Auth group**, **Server cert** (pin),
+**Username**, **Password**, **VPN domains**, **Client cert** — and hides the
+IPSec-only Options tab.
+
+**Guided setup (one-time):**
+- **Fetch groups** contacts the gateway and fills the **Auth group** dropdown with
+  the groups it offers (you can also just type one). It's a single credential-less
+  probe — no tunnel, no root.
+- Picking a group **auto-detects 2FA**: if the gateway marks that group as needing a
+  second factor (`second-auth="1"`), VpncBar ticks **"Ask for one-time code"**.
+- **Save** → a normal static profile. Every connect after is direct (no re-probing).
+
+**Connecting** runs `openconnect --protocol=anyconnect --authgroup=… --script
+<vpnc-script> …` with the password piped on stdin (and, for 2FA groups, a prompt for
+the current one-time code — e.g. Google Authenticator). It reuses the **same
+`vpnc-script`** as vpnc, so routes and scoped DNS behave identically, and Info/Debug
+work the same way.
+
+> SAML/SSO sign-in isn't supported yet. Profiles authenticate with
+> username/password (+ optional client cert) and an optional one-time code.
 
 ### Info tab — live tunnel state
 
@@ -187,7 +220,10 @@ so the only dynamic dependency is `/usr/lib/libSystem` — it runs on any Mac wi
 - **An internet connection for the first build** — `build.sh` downloads the
   `libgpg-error` + `libgcrypt` source from gnupg.org to build them statically.
   After that it's cached in `vendor/deps/`.
-- **No MacPorts or Homebrew** is needed, at build or run time.
+- **No MacPorts or Homebrew** is needed for **vpnc** profiles, at build or run time.
+- **`openconnect`** is required **only for AnyConnect profiles** — install it
+  separately (`brew install openconnect`, or MacPorts). VpncBar finds it at
+  `/opt/homebrew/bin`, `/opt/local/bin`, or `/usr/local/bin`.
 
 ## Build
 
@@ -213,14 +249,14 @@ Two ways — both put the app in `/Applications`, the `vpnc` package in
 
 ```sh
 ./build.sh pkg
-sudo installer -pkg dist/VpncBar-1.1.pkg -target /   # or just double-click the .pkg
+sudo installer -pkg dist/VpncBar-1.2.pkg -target /   # or just double-click the .pkg
 ```
 
 > The `.pkg` is **unsigned** by default. A *downloaded* unsigned pkg trips
 > Gatekeeper (right-click → Open, or allow in System Settings). To sign for real
 > distribution, set a Developer ID and notarize:
 > `PKG_SIGN_ID="Developer ID Installer: …" ./build.sh pkg`, then
-> `xcrun notarytool submit … && xcrun stapler staple dist/VpncBar-1.1.pkg`.
+> `xcrun notarytool submit … && xcrun stapler staple dist/VpncBar-1.2.pkg`.
 
 **B. From source** (`install.sh` builds anything missing, then installs)
 
@@ -230,7 +266,21 @@ open /Applications/VpncBar.app
 ```
 
 The first run sets up notification permission and the sudoers rule so VpncBar can
-run `vpnc`/`vpnc-disconnect` as root without prompting each time.
+run `vpnc`/`vpnc-disconnect` as root without prompting each time. The sudoers rule
+also covers `openconnect` at the standard Homebrew/MacPorts/local paths.
+
+### For AnyConnect (openconnect) profiles
+
+`openconnect` is **not bundled** — it must be installed via **Homebrew or MacPorts**:
+
+```sh
+brew install openconnect      # Homebrew  → /opt/homebrew/bin/openconnect
+# or
+sudo port install openconnect # MacPorts  → /opt/local/bin/openconnect
+```
+
+VpncBar auto-detects it (Homebrew → MacPorts → `/usr/local`). Without it, vpnc
+profiles work fine; AnyConnect profiles will tell you to install it.
 
 ## Uninstall
 
@@ -258,10 +308,13 @@ including the OpenSSL licensing caveat.
 
 1. Menu-bar icon → **Manage VPNs…** → **Add** a profile (or **Import…** a
    `.pcf`/`.conf`).
-2. **Left-click** a profile row to connect; click again to disconnect.
-3. **Right-click** a row to edit it (Credentials / Options / Info / Debug + a
+2. Pick the **Type** — **vpnc** (Cisco IPSec) or **openconnect** (AnyConnect SSL,
+   needs `brew install openconnect`); for openconnect use **Fetch groups** to fill
+   the group dropdown and auto-detect 2FA.
+3. **Left-click** a profile row to connect; click again to disconnect.
+4. **Right-click** a row to edit it (Credentials / Options / Info / Debug + a
    Connect/Disconnect button).
-4. **About VpncBar** shows version info and the **Uninstall** button.
+5. **About VpncBar** shows version info and the **Uninstall** button.
 
 ## Where things are stored
 
@@ -290,8 +343,9 @@ including the OpenSSL licensing caveat.
 |-----------|------------|
 | `src/` | The Swift/AppKit app (`main.swift`), `Info.plist`, app icon + generator. |
 | `vendor/vpnc/` | A vendored, utun-patched `vpnc` (fork of `vpnc` 0.5.3 + breiter's xnu utun port), with a `--log-file` option added. GPLv2. |
-| `vendor/vpnc-script` | The network-config script (from OpenConnect), patched for scoped DNS and a hands-off default route. |
+| `vendor/vpnc-script` | The network-config script (from OpenConnect), patched for scoped DNS and a hands-off default route — used by **both** vpnc and openconnect. |
 | `vendor/deps/` | Statically-built `libgcrypt` + `libgpg-error` (gitignored; produced by `build.sh deps`). |
+| `openconnect` | **Not** vendored — a system install (Homebrew/MacPorts), used only for AnyConnect profiles. |
 | `vendor/NOTICE` | Provenance, licensing, and a full list of local modifications. |
 
 Installed runtime layout — everything in **one folder**, referenced by absolute
