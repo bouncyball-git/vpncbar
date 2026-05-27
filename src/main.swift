@@ -518,6 +518,35 @@ func openconnectArgs(_ p: Profile, binary: String) -> [String] {
     return args
 }
 
+// Fetch the gateway's group list AND each group's 2FA flag in ONE probe. The 2FA
+// requirement is encoded as second-auth="1" on the group's <option>; openconnect's
+// --authgroup matches the option's LABEL (its text), so that's what we store/use.
+// No credentials needed — the group list is in the initial auth form. [] on failure.
+func openconnectGroupList(server: String, serverCert: String?) -> [(group: String, otp: Bool)] {
+    guard let oc = openconnectPath(), !server.isEmpty else { return [] }
+    var args = ["--protocol=anyconnect", "--cookieonly", "--dump-http-traffic",
+                "--user=probe", "--passwd-on-stdin"]
+    if let pin = ne(serverCert) { args.append("--servercert=\(pin)") }
+    args.append(server)
+    // A couple of dummy lines so openconnect reads past its password prompts and the
+    // form (with the group list) gets dumped before auth harmlessly fails.
+    let r = run(oc, args, stdin: "x\ny\n")
+    let out = r.out + "\n" + r.err
+    var result: [(String, Bool)] = []
+    var seen = Set<String>()
+    if let re = try? NSRegularExpression(pattern: "<option([^>]*)>([^<]+)</option>", options: [.caseInsensitive]) {
+        let ns = out as NSString
+        for m in re.matches(in: out, range: NSRange(location: 0, length: ns.length)) {
+            let attrs = ns.substring(with: m.range(at: 1)).lowercased()
+            let label = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !label.isEmpty, seen.insert(label).inserted {
+                result.append((label, attrs.contains("second-auth=\"1\"")))
+            }
+        }
+    }
+    return result
+}
+
 // Connect an openconnect (AnyConnect SSL) profile via a system openconnect, reusing
 // our vpnc-script for routes/scoped-DNS. openconnect reads one value per form prompt
 // from stdin: the account password, then (for 2FA groups) the one-time code.
@@ -1318,7 +1347,7 @@ final class RevealableSecureField: NSView {
     }
 }
 
-final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
+final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComboBoxDelegate {
     let window: NSWindow
     let statsTextView = NSTextView()
     let debugTextView = NSTextView()
@@ -1329,11 +1358,13 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     private var infoTabItem: NSTabViewItem?
     private var debugTabItem: NSTabViewItem?
     private var credsGrid: NSGridView?   // for showing/hiding rows by backend type
+    private var groupOTP: [String: Bool] = [:]   // fetched group → needs one-time code
     let typePopup = NSPopUpButton()      // vpnc | openconnect
     let nameField = NSTextField()
     let gatewayField = NSTextField()
     let idField = NSTextField()
-    let authgroupField = NSTextField()   // openconnect --authgroup
+    let authgroupField = NSComboBox()    // openconnect --authgroup (dropdown if fetched, else manual)
+    let fetchGroupsButton = NSButton(title: "Fetch groups", target: nil, action: nil)
     let serverCertField = NSTextField()  // openconnect --servercert pin
     let otpCheck = NSButton(checkboxWithTitle: "Ask for one-time code", target: nil, action: nil)
     let userField = NSTextField()
@@ -1403,7 +1434,12 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         clientCertField.stringValue = profile?.clientCert ?? ""
         clientCertField.placeholderString = "/path/to/client.pem"
         authgroupField.stringValue = profile?.ocAuthgroup ?? ""
-        authgroupField.placeholderString = "(optional) auth group"
+        authgroupField.placeholderString = "auth group (type, or Fetch)"
+        authgroupField.completes = true
+        authgroupField.delegate = self   // probe the group's auth form when one is picked
+        fetchGroupsButton.bezelStyle = .rounded
+        fetchGroupsButton.target = self
+        fetchGroupsButton.action = #selector(fetchGroups)
         serverCertField.stringValue = profile?.ocServerCert ?? ""
         serverCertField.placeholderString = "(optional) pin-sha256:…"
         otpCheck.state = (profile?.ocOtp ?? false) ? .on : .off
@@ -1460,6 +1496,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             [label("Group name"), idField],          // vpnc only
             [secretLabel, secretField],              // vpnc only
             [label("Auth group"), authgroupField],   // openconnect only
+            [label(""), fetchGroupsButton],          // openconnect only
             [label("Server cert"), serverCertField], // openconnect only
             [label(""), otpCheck],                    // openconnect only
             [label("Username"), userField],
@@ -1824,7 +1861,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
         let oc = typePopup.titleOfSelectedItem == "openconnect"
         func setRowHidden(_ v: NSView, _ hidden: Bool) { credsGrid?.cell(for: v)?.row?.isHidden = hidden }
         for v in [idField, secretField, authmodePopup, caFileField, authNote] { setRowHidden(v, oc) }
-        for v in [authgroupField, serverCertField, otpCheck] { setRowHidden(v, !oc) }
+        for v in [authgroupField, fetchGroupsButton, serverCertField, otpCheck] { setRowHidden(v, !oc) }
         // The Options tab is all vpnc/IPSec parameters — remove it for openconnect.
         if let opts = optionsTabItem {
             let present = tabs.tabViewItems.contains(opts)
@@ -1832,6 +1869,46 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
             else if !oc && !present { tabs.insertTabViewItem(opts, at: 1) }
         }
         if !oc { authModeChanged() }   // restore vpnc cert-field graying
+    }
+
+    // Wizard: one fetch gets the gateway's group list AND each group's 2FA flag.
+    // Fills the dropdown and remembers which groups need a one-time code. Manual
+    // entry still works if nothing comes back.
+    @objc func fetchGroups() {
+        let server = gatewayField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !server.isEmpty else { alert("Enter the Gateway (server) first."); return }
+        let pin = ne(serverCertField.stringValue)
+        fetchGroupsButton.isEnabled = false
+        fetchGroupsButton.title = "Fetching…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let groups = openconnectGroupList(server: server, serverCert: pin)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.fetchGroupsButton.isEnabled = true
+                self.fetchGroupsButton.title = "Fetch groups"
+                guard !groups.isEmpty else {
+                    alert("Couldn't get a group list from \(server).\nType the Auth group manually."); return
+                }
+                self.groupOTP = Dictionary(groups.map { ($0.group, $0.otp) }, uniquingKeysWith: { a, _ in a })
+                let current = self.authgroupField.stringValue
+                self.authgroupField.removeAllItems()
+                self.authgroupField.addItems(withObjectValues: groups.map { $0.group })
+                if current.isEmpty, let first = groups.first {
+                    self.authgroupField.stringValue = first.group
+                    self.otpCheck.state = first.otp ? .on : .off
+                }
+            }
+        }
+    }
+
+    // When a group is picked, set "Ask for one-time code" from what we fetched —
+    // instant, no extra network round-trip.
+    func comboBoxSelectionDidChange(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let g = self.authgroupField.stringValue.trimmingCharacters(in: .whitespaces)
+            if let otp = self.groupOTP[g] { self.otpCheck.state = otp ? .on : .off }
+        }
     }
 
     // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid
