@@ -22,6 +22,7 @@ private var _openconnect: String?? = nil
 func openconnectPath() -> String? {
     if let cached = _openconnect { return cached }
     let found = ["/opt/homebrew/bin/openconnect", "/opt/local/bin/openconnect",
+                 "/opt/local/sbin/openconnect",
                  "/usr/local/bin/openconnect"].first { FileManager.default.isExecutableFile(atPath: $0) }
     _openconnect = found
     return found

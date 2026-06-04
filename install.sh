@@ -38,7 +38,7 @@ sudo install -m 755 uninstall.sh                    "$PKG/uninstall.sh"
 #    AnyConnect profiles) as root without a password. The openconnect paths may not
 #    exist — listing them is harmless and covers Homebrew/MacPorts/local installs.
 DEST="/etc/sudoers.d/vpncbar"
-RULE="$USER_NAME ALL=(root) NOPASSWD: $PKG/vpnc, $PKG/vpnc-disconnect, /opt/homebrew/bin/openconnect, /opt/local/bin/openconnect, /usr/local/bin/openconnect"
+RULE="$USER_NAME ALL=(root) NOPASSWD: $PKG/vpnc, $PKG/vpnc-disconnect, /opt/homebrew/bin/openconnect, /opt/local/bin/openconnect, /opt/local/sbin/openconnect, /usr/local/bin/openconnect"
 echo "Installing sudoers rule (sudo): $RULE"
 printf '%s\n' "$RULE" | sudo tee "$DEST" >/dev/null
 sudo chmod 440 "$DEST"
