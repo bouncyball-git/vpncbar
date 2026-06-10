@@ -1464,7 +1464,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
     init(profile: Profile?, onSave: @escaping (Profile, String?, String?) -> Void) {
         self.onSave = onSave
         self.existing = profile
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 410, height: 470),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 410, height: 510),
                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = profile == nil ? "Add VPN" : "Edit VPN"
         window.isReleasedWhenClosed = false   // we retain it; let ARC free it
