@@ -541,12 +541,17 @@ func openconnectArgs(_ p: Profile, binary: String) -> [String] {
 // Fetch the gateway's group list AND each group's 2FA flag in ONE probe. The 2FA
 // requirement is encoded as second-auth="1" on the group's <option>; openconnect's
 // --authgroup matches the option's LABEL (its text), so that's what we store/use.
-// No credentials needed — the group list is in the initial auth form. [] on failure.
-func openconnectGroupList(server: String, serverCert: String?) -> [(group: String, otp: Bool)] {
-    guard let oc = openconnectPath(), !server.isEmpty else { return [] }
+// No credentials needed — the group list is in the initial auth form.
+// On a self-signed / untrusted gateway cert openconnect refuses to fetch the form
+// and prints its pin-sha256 fingerprint instead. Surface that pin (only when no
+// pin was already passed) so the caller can offer TOFU-style trust + pin.
+func openconnectGroupList(server: String, serverCert: String?)
+    -> (groups: [(group: String, otp: Bool)], certPin: String?) {
+    guard let oc = openconnectPath(), !server.isEmpty else { return ([], nil) }
     var args = ["--protocol=anyconnect", "--cookieonly", "--dump-http-traffic",
                 "--user=probe", "--passwd-on-stdin"]
-    if let pin = ne(serverCert) { args.append("--servercert=\(pin)") }
+    let havePin = ne(serverCert)
+    if let pin = havePin { args.append("--servercert=\(pin)") }
     args.append(server)
     // A couple of dummy lines so openconnect reads past its password prompts and the
     // form (with the group list) gets dumped before auth harmlessly fails.
@@ -564,7 +569,14 @@ func openconnectGroupList(server: String, serverCert: String?) -> [(group: Strin
             }
         }
     }
-    return result
+    // No groups + no pin in play → scan for openconnect's "pin-sha256:…=" line.
+    if result.isEmpty, havePin == nil,
+       let re = try? NSRegularExpression(pattern: "pin-sha256:[A-Za-z0-9+/]+=*"),
+       let m = re.firstMatch(in: out, range: NSRange(out.startIndex..., in: out)),
+       let range = Range(m.range, in: out) {
+        return ([], String(out[range]))
+    }
+    return (result, nil)
 }
 
 // Connect an openconnect (AnyConnect SSL) profile via a system openconnect, reusing
@@ -1411,7 +1423,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
     let authgroupField = NSComboBox()    // openconnect --authgroup (dropdown if fetched, else manual)
     let fetchGroupsButton = NSButton(title: "Fetch groups", target: nil, action: nil)
     let serverCertField = NSTextField()  // openconnect --servercert pin
-    let otpCheck = NSButton(checkboxWithTitle: "Ask for one-time code", target: nil, action: nil)
     let advancedCheck = NSButton(checkboxWithTitle: "Advanced", target: nil, action: nil)  // openconnect: reveal cert fields
     let userField = NSTextField()
     let secretField = RevealableSecureField()
@@ -1495,7 +1506,9 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         fetchGroupsButton.action = #selector(fetchGroups)
         serverCertField.stringValue = profile?.ocServerCert ?? ""
         serverCertField.placeholderString = "(optional) pin-sha256:…"
-        otpCheck.state = (profile?.ocOtp ?? false) ? .on : .off
+        // Seed groupOTP from the saved profile so a re-opened editor (no Fetch yet)
+        // still knows whether the persisted Auth group needs a one-time code.
+        if let g = ne(profile?.ocAuthgroup), let otp = profile?.ocOtp { groupOTP[g] = otp }
         // openconnect: hide the rarely-used cert fields behind "Advanced", but expand
         // it automatically if this profile already has a server-cert pin or client cert.
         advancedCheck.state = (ne(profile?.ocServerCert) != nil || ne(profile?.clientCert) != nil) ? .on : .off
@@ -1569,7 +1582,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
             [secretLabel, secretField],              // vpnc only
             [label("Auth group"), authgroupField],   // openconnect only
             [label(""), fetchGroupsButton],          // openconnect only
-            [label(""), otpCheck],                    // openconnect only
             [label("Username"), userField],
             [label("Password"), passwordField],
             [label("VPN domains"), dnsField],
@@ -1784,7 +1796,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         let connected = !connectedTunnels([p]).isEmpty
         // 2FA openconnect: gather the one-time code (main thread) before connecting.
         var otp: String? = nil
-        if !connected && isOpenconnect(p) && (p.ocOtp ?? false) {
+        if !connected && isOpenconnect(p) && needsOtp() {
             guard let code = promptOTP(p) else { return }   // cancelled
             otp = code
         }
@@ -1946,7 +1958,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         let adv = oc && (advancedCheck.state == .on)   // openconnect cert fields revealed
         func setRowHidden(_ v: NSView, _ hidden: Bool) { credsGrid?.cell(for: v)?.row?.isHidden = hidden }
         for v in [idField, secretField, authmodePopup, caFileField, authNote] { setRowHidden(v, oc) }
-        for v in [authgroupField, fetchGroupsButton, otpCheck, advancedCheck] { setRowHidden(v, !oc) }
+        for v in [authgroupField, fetchGroupsButton, advancedCheck] { setRowHidden(v, !oc) }
         // openconnect cert fields live under "Advanced". Client cert is shared: vpnc
         // always shows it (authmode-reactive); openconnect shows it only when Advanced.
         setRowHidden(serverCertField, !adv)
@@ -1973,34 +1985,52 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         fetchGroupsButton.isEnabled = false
         fetchGroupsButton.title = "Fetching…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let groups = openconnectGroupList(server: server, serverCert: pin)
+            let probe = openconnectGroupList(server: server, serverCert: pin)
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.fetchGroupsButton.isEnabled = true
                 self.fetchGroupsButton.title = "Fetch groups"
-                guard !groups.isEmpty else {
+                // Trust-on-first-use: the gateway's cert isn't trusted by the system
+                // (self-signed / private CA). Show the fingerprint and, on consent,
+                // pin it into Server cert and retry — the pin is enforced thereafter.
+                if let certPin = probe.certPin {
+                    let a = NSAlert()
+                    a.alertStyle = .warning
+                    a.messageText = "Untrusted server certificate"
+                    a.informativeText =
+                        "The gateway “\(server)” presented a certificate the system doesn't trust "
+                      + "(self-signed, or from a private CA).\n\nFingerprint:\n\(certPin)\n\n"
+                      + "Trust and pin this certificate? It's saved to the profile and required on "
+                      + "every future connection — you'll be warned if it ever changes."
+                    a.addButton(withTitle: "Trust and pin")
+                    a.addButton(withTitle: "Cancel")
+                    if a.runModal() == .alertFirstButtonReturn {
+                        self.serverCertField.stringValue = certPin
+                        self.fetchGroups()   // retry — the pin now lets the probe through
+                    }
+                    return
+                }
+                guard !probe.groups.isEmpty else {
                     alert("Couldn't get a group list from \(server).\nType the Auth group manually."); return
                 }
-                self.groupOTP = Dictionary(groups.map { ($0.group, $0.otp) }, uniquingKeysWith: { a, _ in a })
+                self.groupOTP = Dictionary(probe.groups.map { ($0.group, $0.otp) }, uniquingKeysWith: { a, _ in a })
                 let current = self.authgroupField.stringValue
                 self.authgroupField.removeAllItems()
-                self.authgroupField.addItems(withObjectValues: groups.map { $0.group })
-                if current.isEmpty, let first = groups.first {
+                self.authgroupField.addItems(withObjectValues: probe.groups.map { $0.group })
+                if current.isEmpty, let first = probe.groups.first {
                     self.authgroupField.stringValue = first.group
-                    self.otpCheck.state = first.otp ? .on : .off
                 }
             }
         }
     }
 
-    // When a group is picked, set "Ask for one-time code" from what we fetched —
-    // instant, no extra network round-trip.
-    func comboBoxSelectionDidChange(_ notification: Notification) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            let g = self.authgroupField.stringValue.trimmingCharacters(in: .whitespaces)
-            if let otp = self.groupOTP[g] { self.otpCheck.state = otp ? .on : .off }
-        }
+    // Does the currently-selected openconnect group need a one-time code? Looks the
+    // group up in the last Fetch groups result; for a group not fetched this session
+    // (typed by hand, or the editor opened without fetching) falls back to the saved
+    // ocOtp flag — which we also seed into groupOTP at load time.
+    private func needsOtp() -> Bool {
+        let g = authgroupField.stringValue.trimmingCharacters(in: .whitespaces)
+        return groupOTP[g] ?? (existing?.ocOtp ?? false)
     }
 
     // React to the IKE Authmode selection: psk uses the Group secret; cert/hybrid
@@ -2077,7 +2107,7 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
             extra: existing?.extra,
             kind: oc ? "openconnect" : "vpnc",
             ocAuthgroup: tv(authgroupField), ocServerCert: tv(serverCertField),
-            ocOtp: oc ? (otpCheck.state == .on) : nil,
+            ocOtp: (oc && needsOtp()) ? true : nil,
             ocProtocol: pv(ocProtocolPopup), ocNoDTLS: oc ? (ocNoDTLSCheck.state == .on) : nil,
             ocDPD: tv(ocDPDField), ocMTU: tv(ocMTUField),
             ocReconnect: tv(ocReconnectField), ocDebug: pv(ocDebugPopup))
