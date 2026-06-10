@@ -10,7 +10,6 @@ let kVpncDisconnect = "/opt/vpncbar/vpnc-disconnect"
 let kCiscoDecrypt = "/opt/vpncbar/cisco-decrypt"
 let kSecurity = "/usr/bin/security"
 let kSudo = "/usr/bin/sudo"
-let kPgrep = "/usr/bin/pgrep"
 let kPs = "/bin/ps"
 let kOtool = "/usr/bin/otool"
 let kNetstat = "/usr/sbin/netstat"
@@ -1331,9 +1330,6 @@ final class AboutWindow: NSObject {
 
 // MARK: - Profile editor sheet
 
-/// Top-origin view so the scrolled form starts at the top, not the bottom.
-final class FlippedView: NSView { override var isFlipped: Bool { true } }
-
 /// A button that shows the standard arrow cursor instead of inheriting the I-beam
 /// cursor rect of the text field it's overlaid on.
 final class ArrowButton: NSButton {
@@ -1402,7 +1398,7 @@ final class RevealableSecureField: NSView {
     }
 }
 
-final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComboBoxDelegate {
+final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate {
     let window: NSWindow
     let statsTextView = NSTextView()
     let debugTextView = NSTextView()
@@ -1499,7 +1495,6 @@ final class ProfileEditor: NSObject, NSWindowDelegate, NSTabViewDelegate, NSComb
         authgroupField.stringValue = profile?.ocAuthgroup ?? ""
         authgroupField.placeholderString = "auth group (type, or Fetch)"
         authgroupField.completes = true
-        authgroupField.delegate = self   // probe the group's auth form when one is picked
         fetchGroupsButton.bezelStyle = .rounded
         fetchGroupsButton.target = self
         fetchGroupsButton.action = #selector(fetchGroups)

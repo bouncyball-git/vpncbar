@@ -126,8 +126,9 @@ IPSec-only Options tab.
 - **Fetch groups** contacts the gateway and fills the **Auth group** dropdown with
   the groups it offers (you can also just type one). It's a single credential-less
   probe — no tunnel, no root.
-- Picking a group **auto-detects 2FA**: if the gateway marks that group as needing a
-  second factor (`second-auth="1"`), VpncBar ticks **"Ask for one-time code"**.
+- **2FA is auto-detected per group**: if the gateway marks the selected group as
+  needing a second factor (`second-auth="1"`), VpncBar prompts for a one-time code
+  on every connect — no checkbox to flip.
 - **Save** → a normal static profile. Every connect after is direct (no re-probing).
 
 **Connecting** runs `openconnect --protocol=anyconnect --authgroup=… --script
