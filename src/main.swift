@@ -625,7 +625,6 @@ func connectOpenconnect(_ p: Profile, otp: String? = nil) -> ActionResult {
 func promptOTP(_ p: Profile) -> String? {
     let a = NSAlert()
     a.messageText = "One-time code for “\(p.name)”"
-    a.informativeText = "Enter the current 2FA code (e.g. from Google Authenticator)."
     a.addButton(withTitle: "Connect")
     a.addButton(withTitle: "Cancel")
     let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
