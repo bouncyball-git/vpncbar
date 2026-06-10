@@ -249,14 +249,14 @@ Two ways — both put the app in `/Applications`, the `vpnc` package in
 
 ```sh
 ./build.sh pkg
-sudo installer -pkg dist/VpncBar-1.2.pkg -target /   # or just double-click the .pkg
+sudo installer -pkg dist/VpncBar-1.2.1.pkg -target /   # or just double-click the .pkg
 ```
 
 > The `.pkg` is **unsigned** by default. A *downloaded* unsigned pkg trips
 > Gatekeeper (right-click → Open, or allow in System Settings). To sign for real
 > distribution, set a Developer ID and notarize:
 > `PKG_SIGN_ID="Developer ID Installer: …" ./build.sh pkg`, then
-> `xcrun notarytool submit … && xcrun stapler staple dist/VpncBar-1.2.pkg`.
+> `xcrun notarytool submit … && xcrun stapler staple dist/VpncBar-1.2.1.pkg`.
 
 **B. From source** (`install.sh` builds anything missing, then installs)
 
