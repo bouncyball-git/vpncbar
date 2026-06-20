@@ -54,9 +54,26 @@ build_deps() {
     echo "[deps] built $DEPS/lib/libgcrypt.a + libgpg-error.a"
 }
 
+# True if $1 (output) exists and no file in the remaining args is newer than it,
+# i.e. the output is up to date. FORCE=1 makes this always false (force rebuild).
+up_to_date() {
+    out="$1"; shift
+    [ "${FORCE:-0}" = 1 ] && return 1
+    [ -f "$out" ] || return 1
+    for src in "$@"; do
+        [ -e "$src" ] && [ "$src" -nt "$out" ] && return 1
+    done
+    return 0
+}
+
 # --- vpnc: statically-linked, utun-capable vpnc ------------------------------
 build_vpnc() {
     [ -f "$VPNC_DIR/Makefile" ] || { echo "error: $VPNC_DIR/Makefile not found" >&2; exit 1; }
+    if [ -f "$VPNC_DIR/bin/cisco-decrypt" ] && \
+       up_to_date "$VPNC_DIR/bin/vpnc" "$VPNC_DIR"/*.c "$VPNC_DIR"/*.h "$VPNC_DIR/Makefile"; then
+        echo "[vpnc] already up to date ($VPNC_DIR/bin/vpnc) — skipping. (FORCE=1 to rebuild)"
+        return 0
+    fi
     build_deps   # ensure the static archives exist
     echo "[vpnc] building (static, CRYPTO_NONE=yes, SCRIPT_PATH=$SCRIPT_PATH)…"
     # Our static libgcrypt-config wins on PATH; its lib dir is .a-only, so the link
@@ -74,6 +91,11 @@ build_app() {
     SRCDIR="src"
     SOURCES=$(find "$SRCDIR" -name '*.swift' -not -name 'make-icon.swift' | sort)
     [ -n "$SOURCES" ] || { echo "error: no .swift sources" >&2; exit 1; }
+    # shellcheck disable=SC2086
+    if up_to_date "$APP/Contents/MacOS/VpncBar" $SOURCES "$SRCDIR/Info.plist" "$SRCDIR/VpncBar.icns"; then
+        echo "[app] already up to date ($APP) — skipping. (FORCE=1 to rebuild)"
+        return 0
+    fi
     echo "[app] compiling Swift sources…"
     mkdir -p bin
     # shellcheck disable=SC2086
