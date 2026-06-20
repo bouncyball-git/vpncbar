@@ -787,6 +787,16 @@ final class ProfileMenuItemView: NSView {
         DispatchQueue.main.async(execute: action)
     }
 
+    // When the menu's window isn't key, AppKit treats the first click as a mere
+    // activation click and swallows it — so connecting took two clicks (the
+    // first activated, the second acted). Standard NSMenuItems are immune; our
+    // custom view isn't unless it opts into receiving that first click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    // AppKit only delivers mouseUp to the view that claimed the preceding
+    // mouseDown, so claim it here to guarantee our mouseUp below fires.
+    override func mouseDown(with event: NSEvent) { }
+
     // Exactly one action per click: control-click edits, plain click connects.
     override func mouseUp(with event: NSEvent) {
         if event.modifierFlags.contains(.control) { fire(onEdit) } else { fire(onConnect) }
